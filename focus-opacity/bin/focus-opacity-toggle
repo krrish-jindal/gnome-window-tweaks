@@ -1,0 +1,43 @@
+#!/usr/bin/env python3
+"""Turn the focus-opacity effects on or off, for binding to a shortcut.
+
+This is the "Effects running" switch from the prefs window, as a one-shot
+command. Stopping the unit is a clean off switch on its own: ExecStopPost runs
+`focus-opacity --restore`, which clears the window opacity and puts the sharp
+wallpaper back.
+"""
+
+import subprocess
+import sys
+
+UNIT = 'focus-opacity.service'
+
+
+def systemctl(*args):
+    return subprocess.run(['systemctl', '--user', *args],
+                          capture_output=True, text=True)
+
+
+def notify(body):
+    subprocess.run(['notify-send', '-a', 'Window Effects',
+                    '-i', 'preferences-desktop-wallpaper',
+                    '-t', '2500', 'Window Effects', body], check=False)
+
+
+def main():
+    running = systemctl('is-active', UNIT).stdout.strip() == 'active'
+    action = 'stop' if running else 'start'
+
+    result = systemctl(action, UNIT)
+    if result.returncode != 0:
+        notify(f'Could not {action} the service -- see journalctl --user -u {UNIT}')
+        print(result.stderr.strip(), file=sys.stderr)
+        return 1
+
+    notify('Effects off -- windows opaque, wallpaper sharp' if running
+           else 'Effects on -- unfocused windows fading')
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

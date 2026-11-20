@@ -1,0 +1,7 @@
+# generated / local-only
+*.compiled
+__pycache__/
+*.pyc
+*.bak*
+node_modules/
+.DS_Store

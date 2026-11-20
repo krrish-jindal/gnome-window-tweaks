@@ -1,0 +1,125 @@
+#!/usr/bin/env python3
+"""Identify the next window that opens, and optionally exclude it from tiling.
+
+Run this, then open the window you want left alone (a picture-in-picture player,
+a popup). It prints exactly how that window identifies itself, so the exclusion
+matches the real thing instead of a guess.
+
+  wintile-never-tile          watch and report
+  wintile-never-tile --add    watch, report, and add it to WinTile's never-tile list
+
+Matching by WM_CLASS would be wrong for a browser popup: it reports the same
+class as every other browser window, so excluding the class would stop tiling
+the browser entirely. This picks the title instead whenever the class is shared
+with another open window.
+"""
+
+import os
+import re
+import subprocess
+import sys
+
+SCHEMA = 'org.gnome.shell.extensions.wintile'
+SCHEMADIR = os.path.expanduser(
+    '~/.local/share/gnome-shell/extensions/wintile@nowsci.com/schemas')
+
+
+def run(*args):
+    try:
+        out = subprocess.run(args, capture_output=True, text=True, timeout=10)
+        return out.stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return ''
+
+
+def clients():
+    return re.findall(r'0x[0-9a-fA-F]+', run('xprop', '-root', '_NET_CLIENT_LIST'))
+
+
+def describe(wid):
+    cls = re.findall(r'"([^"]*)"', run('xprop', '-id', wid, 'WM_CLASS'))
+    title = re.search(r'=\s*"(.*)"', run('xprop', '-id', wid, 'WM_NAME'))
+    states = re.findall(r'_NET_WM_STATE_(\w+)',
+                        run('xprop', '-id', wid, '_NET_WM_STATE'))
+    types = re.findall(r'_NET_WM_WINDOW_TYPE_(\w+)',
+                       run('xprop', '-id', wid, '_NET_WM_WINDOW_TYPE'))
+    geo = re.search(r'(\d+)x(\d+)\+(-?\d+)\+(-?\d+)',
+                    run('xwininfo', '-id', wid))
+    return {
+        'id': wid,
+        'class': cls[-1] if cls else '',
+        'title': title.group(1) if title else '',
+        'states': states,
+        'type': types[0] if types else '',
+        'geometry': geo.group(0) if geo else '',
+    }
+
+
+def blacklist():
+    raw = run('gsettings', '--schemadir', SCHEMADIR, 'get', SCHEMA,
+              'auto-tile-blacklist').strip()
+    try:
+        import ast
+        return list(ast.literal_eval(raw)) if raw else []
+    except (ValueError, SyntaxError):
+        return []
+
+
+def set_blacklist(items):
+    value = '[' + ', '.join("'" + i.replace("'", "\\'") + "'" for i in items) + ']'
+    run('gsettings', '--schemadir', SCHEMADIR, 'set', SCHEMA,
+        'auto-tile-blacklist', value)
+
+
+def main():
+    add = '--add' in sys.argv
+    if {'-h', '--help'} & set(sys.argv[1:]):
+        print(__doc__)
+        return 0
+
+    before = set(clients())
+    print('Watching. Open the window you want excluded — Ctrl+C to stop.\n')
+    spy = subprocess.Popen(['xprop', '-root', '-spy', '_NET_CLIENT_LIST'],
+                           stdout=subprocess.PIPE, text=True)
+    try:
+        for _line in spy.stdout:
+            fresh = [w for w in clients() if w not in before]
+            before |= set(fresh)
+            for wid in fresh:
+                d = describe(wid)
+                print(f"  new window {d['id']}")
+                print(f"    class     {d['class']}")
+                print(f"    title     {d['title']}")
+                print(f"    type      {d['type']}")
+                print(f"    states    {', '.join(d['states']) or '(none)'}")
+                print(f"    geometry  {d['geometry']}")
+
+                if 'ABOVE' in d['states']:
+                    print("    -> already excluded: it is always-on-top\n")
+                    continue
+
+                # Prefer the title when the class is shared with another window.
+                others = [describe(w)['class'] for w in before if w != wid]
+                key = d['title'] if d['class'] in others else d['class']
+                if not key:
+                    print("    -> no usable name to match on\n")
+                    continue
+                current = blacklist()
+                if any(key.lower() == e.lower() for e in current):
+                    print(f"    -> already on the never-tile list: {key!r}\n")
+                elif add:
+                    set_blacklist(current + [key])
+                    print(f"    -> added to never-tile list: {key!r}")
+                    print("       (takes effect immediately, no restart)\n")
+                else:
+                    print(f"    -> would exclude by {'title' if key == d['title'] else 'class'}: {key!r}")
+                    print("       re-run with --add to apply it\n")
+    except KeyboardInterrupt:
+        pass
+    finally:
+        spy.terminate()
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

@@ -1,0 +1,857 @@
+#!/usr/bin/env python3
+"""Fade unfocused X11 windows, and blur each monitor's wallpaper independently.
+
+opacity   Unfocused windows get _NET_WM_WINDOW_OPACITY. A GNOME Shell extension
+          can only set a window actor's *Clutter* opacity, which never tells
+          mutter the window turned translucent -- so mutter keeps unredirecting
+          monitor-sized windows and culling the wallpaper behind them, and the
+          fade never reaches the screen. The X property goes through mutter's
+          own path: it updates the opaque region, so maximized windows fade and
+          the wallpaper is painted behind them. (Measured: 0.02 vs 27.56.)
+
+wallpaper GNOME can only show ONE background image, stretched across every
+          monitor ('spanned'). So per-monitor blur is done by pre-compositing:
+          for each combination of "which monitors have a window on them", an
+          image is generated whose slice for a busy monitor is blurred and whose
+          slice for an empty monitor is left sharp. Switching monitors is then
+          just picking a different file, which is instant. Blur is taken from a
+          blur of the WHOLE image, so region edges carry no seam artifacts.
+
+X11 only -- _NET_WM_WINDOW_OPACITY is meaningless on Wayland.
+"""
+
+import json
+import os
+import re
+import signal
+import subprocess
+import sys
+import threading
+import time
+
+CONFIG = os.path.expanduser('~/.config/focus-opacity.json')
+WPDIR = os.path.expanduser('~/.local/share/backgrounds/focus-blur')
+HYDRA = os.path.expanduser('~/.cache/org.gabmus.hydrapaper')
+OPAQUE = 0xFFFFFFFF
+ALL_DESKTOPS = 0xFFFFFFFF
+MAX_MONITORS = 4          # 2**4 = 16 composites per theme; beyond this, fall back
+
+DEFAULTS = {
+    'unfocused': 80,
+    'focused': 100,
+    'types': ['NORMAL', 'DIALOG', 'UTILITY'],
+    'skip_classes': [],
+    'skip_fullscreen': True,         # never fade fullscreen video / games
+    'skip_above': True,              # never fade always-on-top windows (PiP)
+    'debounce_ms': 60,
+    'fade_ms': 200,                  # window opacity cross-fade; 0 = snap
+    'fade_fps': 60,                  # frames per second while fading
+    'auto_rebuild': True,            # notice wallpaper changes and re-render
+    'adaptive_wallpaper': True,
+    'per_monitor_wallpaper': True,   # False = one blur decision for all screens
+    'cover_threshold': 0.10,         # fraction of a screen a window must cover
+                                     # for that screen to count as busy
+    'blur_radius': 16,
+    'jpeg_quality': 92,
+    'sharp_light': f'{HYDRA}/merged_wallpaper.png',
+    'sharp_dark': f'{HYDRA}/merged_wallpaper_dark.png',
+}
+
+
+def load_config():
+    cfg = dict(DEFAULTS)
+    try:
+        with open(CONFIG) as fh:
+            stored = json.load(fh)
+        cfg.update({k: v for k, v in stored.items() if k in DEFAULTS})
+    except FileNotFoundError:
+        pass
+    except (OSError, ValueError) as exc:
+        print(f'focus-opacity: ignoring bad config ({exc})', file=sys.stderr)
+    try:
+        with open(CONFIG, 'w') as fh:
+            json.dump(cfg, fh, indent=2)
+            fh.write('\n')
+    except OSError:
+        pass
+    return cfg
+
+
+def run(*args, timeout=10):
+    try:
+        out = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
+        return out.stdout if out.returncode == 0 else ''
+    except (OSError, subprocess.TimeoutExpired):
+        return ''
+
+
+def xprop(*args):
+    return run('xprop', *args)
+
+
+def root_ids(prop):
+    return re.findall(r'0x[0-9a-fA-F]+', xprop('-root', prop))
+
+
+def root_int(prop):
+    m = re.search(r'=\s*(\d+)', xprop('-root', prop))
+    return int(m.group(1)) if m else None
+
+
+class X11:
+    """Write window properties straight to the X server.
+
+    Spawning xprop costs ~4 ms per write because each invocation opens its own
+    X connection; that caps a fade near 20 fps and makes frame spacing uneven.
+    Going through Xlib directly measured ~0.003 ms here -- about 1400x cheaper
+    -- which is what makes a smooth 60 fps fade possible at all. Falls back to
+    xprop if libX11 cannot be loaded.
+    """
+
+    XA_CARDINAL = 6
+    PROP_MODE_REPLACE = 0
+
+    def __init__(self, prop='_NET_WM_WINDOW_OPACITY'):
+        self.ok = False
+        try:
+            import ctypes
+            import ctypes.util
+            name = ctypes.util.find_library('X11')
+            if not name:
+                return
+            lib = ctypes.CDLL(name)
+            lib.XInitThreads()          # apply() and the animator both write
+            lib.XOpenDisplay.restype = ctypes.c_void_p
+            lib.XOpenDisplay.argtypes = [ctypes.c_char_p]
+            lib.XInternAtom.restype = ctypes.c_ulong
+            lib.XInternAtom.argtypes = [ctypes.c_void_p, ctypes.c_char_p,
+                                        ctypes.c_int]
+            lib.XChangeProperty.argtypes = [
+                ctypes.c_void_p, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong,
+                ctypes.c_int, ctypes.c_int, ctypes.c_void_p, ctypes.c_int]
+            lib.XDeleteProperty.argtypes = [ctypes.c_void_p, ctypes.c_ulong,
+                                            ctypes.c_ulong]
+            lib.XFlush.argtypes = [ctypes.c_void_p]
+            display = lib.XOpenDisplay(None)
+            if not display:
+                return
+            # Xlib's default error handler calls exit(). Writing to a window
+            # that closed mid-fade is normal here, so swallow errors instead.
+            handler = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p,
+                                       ctypes.c_void_p)
+            self._handler = handler(lambda _d, _e: 0)   # keep a reference
+            lib.XSetErrorHandler(self._handler)
+            self._ctypes = ctypes
+            self._lib = lib
+            self._display = display
+            self.atom = lib.XInternAtom(display, prop.encode(), False)
+            self.ok = bool(self.atom)
+        except Exception:
+            self.ok = False
+
+    def set_cardinal(self, wid, value):
+        holder = self._ctypes.c_ulong(int(value))
+        self._lib.XChangeProperty(
+            self._display, int(wid, 16), self.atom, self.XA_CARDINAL, 32,
+            self.PROP_MODE_REPLACE, self._ctypes.byref(holder), 1)
+
+    def delete(self, wid):
+        self._lib.XDeleteProperty(self._display, int(wid, 16), self.atom)
+
+    def flush(self):
+        if self.ok:
+            self._lib.XFlush(self._display)
+
+
+def screen_size():
+    out = run('xwininfo', '-root')
+    w = re.search(r'Width:\s+(\d+)', out)
+    h = re.search(r'Height:\s+(\d+)', out)
+    return (int(w.group(1)), int(h.group(1))) if w and h else None
+
+
+MON_RE = re.compile(
+    r'^\s*\d+:\s+\+(\*?)(\S+)\s+(\d+)/\d+x(\d+)/\d+\+(-?\d+)\+(-?\d+)')
+
+
+def monitors():
+    """Monitor rectangles, ordered left-to-right then top-to-bottom.
+
+    The order fixes each monitor's bit position in the composite mask, so it has
+    to be deterministic rather than however xrandr happened to list them.
+    """
+    mons = []
+    for line in run('xrandr', '--listmonitors').splitlines():
+        m = MON_RE.match(line)
+        if m:
+            mons.append({'name': m.group(2), 'primary': m.group(1) == '*',
+                         'w': int(m.group(3)), 'h': int(m.group(4)),
+                         'x': int(m.group(5)), 'y': int(m.group(6))})
+    mons.sort(key=lambda d: (d['x'], d['y']))
+    return mons
+
+
+GEOM_RE = re.compile(
+    r'^\s+(0x[0-9a-fA-F]+).*?\s(\d+)x(\d+)\+-?\d+\+-?\d+\s+\+(-?\d+)\+(-?\d+)\s*$')
+
+
+def window_geometry(wanted=()):
+    """Absolute rect per window, from a single xwininfo call where possible.
+
+    Per-window xwininfo would be one subprocess per window on every event, so
+    the children listing is read in one go. Server-side decorated windows are
+    reparented into a frame and so are NOT direct children of root; those are
+    filled in individually, because a window with no geometry would otherwise be
+    silently dropped and leave its monitor looking empty.
+    """
+    geo = {}
+    for line in run('xwininfo', '-root', '-children').splitlines():
+        m = GEOM_RE.match(line)
+        if m:
+            geo[m.group(1).lower()] = (int(m.group(4)), int(m.group(5)),
+                                       int(m.group(2)), int(m.group(3)))
+    for wid in wanted:
+        if wid.lower() in geo:
+            continue
+        out = run('xwininfo', '-id', wid)
+        x = re.search(r'Absolute upper-left X:\s+(-?\d+)', out)
+        y = re.search(r'Absolute upper-left Y:\s+(-?\d+)', out)
+        w = re.search(r'Width:\s+(\d+)', out)
+        h = re.search(r'Height:\s+(\d+)', out)
+        if x and y and w and h:
+            geo[wid.lower()] = (int(x.group(1)), int(y.group(1)),
+                                int(w.group(1)), int(h.group(1)))
+    return geo
+
+
+class Wallpaper:
+    """Pick the background image matching which monitors are currently busy."""
+
+    SCHEMA = 'org.gnome.desktop.background'
+
+    def __init__(self, cfg):
+        self.cfg = cfg
+        self.state = None
+        self.layout = None      # monitors the composites were built for
+        self.building = False
+
+    def _path(self, kind, mask):
+        return os.path.join(WPDIR, f'wp-{kind}-m{mask}.jpg')
+
+    def _sharp(self, kind):
+        return os.path.expanduser(self.cfg[f'sharp_{kind}'])
+
+    def _manifest_path(self):
+        return os.path.join(WPDIR, 'manifest.json')
+
+    def _signature(self, mons, screen):
+        return {
+            'screen': list(screen),
+            'monitors': [[m['x'], m['y'], m['w'], m['h']] for m in mons],
+            'radius': int(self.cfg['blur_radius']),
+            'quality': int(self.cfg['jpeg_quality']),
+            'sources': {k: [self._sharp(k),
+                            int(os.path.getmtime(self._sharp(k)))
+                            if os.path.exists(self._sharp(k)) else 0]
+                        for k in ('light', 'dark')},
+        }
+
+    @staticmethod
+    def _cover(im, size):
+        """Scale to cover `size`, then centre-crop -- what 'spanned' would do.
+
+        Generating at exactly the screen size means GNOME maps the image 1:1 and
+        the monitor rectangles land where they are supposed to.
+        """
+        from PIL import Image
+        tw, th = size
+        sw, sh = im.size
+        scale = max(tw / sw, th / sh)
+        nw, nh = max(tw, round(sw * scale)), max(th, round(sh * scale))
+        im = im.resize((nw, nh), Image.LANCZOS)
+        left, top = (nw - tw) // 2, (nh - th) // 2
+        return im.crop((left, top, left + tw, top + th))
+
+    def build(self, force=False, verbose=False):
+        """Generate one composite per combination of busy monitors."""
+        mons = monitors()
+        screen = screen_size()
+        if not mons or not screen:
+            return []
+        self.layout = mons
+        if len(mons) > MAX_MONITORS:
+            if verbose:
+                print(f'  {len(mons)} monitors > limit {MAX_MONITORS};'
+                      ' falling back to all-or-nothing')
+            mons = []
+
+        sig = self._signature(mons or monitors(), screen)
+        os.makedirs(WPDIR, exist_ok=True)
+        try:
+            with open(self._manifest_path()) as fh:
+                fresh = json.load(fh) == sig
+        except (OSError, ValueError):
+            fresh = False
+
+        n = len(mons)
+        masks = range(1, 1 << n) if n else [1]
+        needed = [self._path(k, m) for k in ('light', 'dark') for m in masks]
+        if fresh and not force and all(os.path.exists(p) for p in needed):
+            return []
+
+        try:
+            from PIL import Image, ImageFilter
+        except ImportError:
+            print('focus-opacity: python3-pil missing, cannot blur',
+                  file=sys.stderr)
+            return []
+
+        radius = max(1, int(self.cfg['blur_radius']))
+        quality = max(60, min(100, int(self.cfg['jpeg_quality'])))
+        made = []
+        for kind in ('light', 'dark'):
+            src = self._sharp(kind)
+            if not os.path.exists(src):
+                continue
+            base = self._cover(Image.open(src).convert('RGB'), screen)
+            # Blur the whole image once; regions are cut from THIS, so a blurred
+            # slice never shows the dark fringe a cropped-then-blurred one would.
+            blurred = base.filter(ImageFilter.GaussianBlur(radius))
+            for mask in masks:
+                img = base.copy()
+                boxes = ([(m['x'], m['y'], m['x'] + m['w'], m['y'] + m['h'])
+                          for i, m in enumerate(mons) if mask & (1 << i)]
+                         if n else [(0, 0, screen[0], screen[1])])
+                for box in boxes:
+                    box = (max(0, box[0]), max(0, box[1]),
+                           min(screen[0], box[2]), min(screen[1], box[3]))
+                    if box[2] > box[0] and box[3] > box[1]:
+                        img.paste(blurred.crop(box), box)
+                dst = self._path(kind, mask)
+                # Write via a temp file: a half-written JPEG must never be
+                # something GNOME can be pointed at.
+                tmp = dst + '.tmp'
+                img.save(tmp, 'JPEG', quality=quality, optimize=True,
+                         progressive=True)
+                os.replace(tmp, dst)
+                made.append(dst)
+                if verbose:
+                    busy = ([m['name'] for i, m in enumerate(mons) if mask & (1 << i)]
+                            if n else ['all'])
+                    print(f'  {kind:5s} mask {mask:2d} blurred={",".join(busy)}'
+                          f'  {os.path.getsize(dst) // 1024} KiB')
+        # Drop composites belonging to a previous layout: with fewer monitors
+        # than before, the high-numbered masks are unreachable but a stale file
+        # could still be picked if a mask ever matched it.
+        valid = {os.path.basename(self._path(k, m))
+                 for k in ('light', 'dark') for m in masks}
+        try:
+            for name in os.listdir(WPDIR):
+                if name.startswith('wp-') and name.endswith('.jpg') \
+                        and name not in valid:
+                    os.remove(os.path.join(WPDIR, name))
+        except OSError:
+            pass
+
+        try:
+            with open(self._manifest_path(), 'w') as fh:
+                json.dump(sig, fh, indent=2)
+        except OSError:
+            pass
+        return made
+
+    def stale(self):
+        """Cheap check: do the composites still match sources and layout?"""
+        mons = monitors()
+        screen = screen_size()
+        if not mons or not screen:
+            return False
+        try:
+            with open(self._manifest_path()) as fh:
+                return json.load(fh) != self._signature(mons, screen)
+        except (OSError, ValueError):
+            return True
+
+    def owns(self, path):
+        """Was this image written by us? Distinguishes our own gsettings writes
+        from a wallpaper the user just picked in HydraPaper or Settings."""
+        return os.path.dirname(os.path.abspath(path)) == os.path.abspath(WPDIR)
+
+    def adopt(self, kind, path):
+        """Treat an externally-chosen image as the new sharp source."""
+        if not os.path.exists(path) or self.owns(path):
+            return False
+        if os.path.abspath(path) == os.path.abspath(self._sharp(kind)):
+            return False
+        self.cfg[f'sharp_{kind}'] = path
+        try:
+            with open(CONFIG) as fh:
+                stored = json.load(fh)
+        except (OSError, ValueError):
+            stored = {}
+        stored[f'sharp_{kind}'] = path
+        try:
+            with open(CONFIG, 'w') as fh:
+                json.dump(stored, fh, indent=2)
+                fh.write('\n')
+        except OSError:
+            pass
+        return True
+
+    def set(self, mask):
+        """mask 0 uses the untouched originals, so nothing is re-encoded."""
+        if self.building or not self.cfg['adaptive_wallpaper'] or mask == self.state:
+            return
+        for kind, key in (('light', 'picture-uri'), ('dark', 'picture-uri-dark')):
+            path = self._sharp(kind) if mask == 0 else self._path(kind, mask)
+            if not os.path.exists(path):
+                path = self._sharp(kind)
+            if os.path.exists(path):
+                run('gsettings', 'set', self.SCHEMA, key, 'file://' + path)
+        self.state = mask
+
+
+class Fader:
+    def __init__(self, cfg):
+        self.cfg = cfg
+        self.types = {t.upper() for t in cfg['types']}
+        self.skip = {c.lower() for c in cfg['skip_classes']}
+        self._meta = {}
+        self._applied = {}
+        self._targets = {}
+        self._anim = {}          # wid -> (start, target, frame)
+        self._lock = threading.Lock()
+        self._wake = threading.Event()
+        self._stop = False
+        self.animate = False
+        self._rebuilding = False
+        self._x = X11()
+        self.wallpaper = Wallpaper(cfg)
+
+    def _describe(self, wid):
+        if wid not in self._meta:
+            types = re.findall(r'_NET_WM_WINDOW_TYPE_(\w+)',
+                               xprop('-id', wid, '_NET_WM_WINDOW_TYPE'))
+            klass = re.findall(r'"([^"]*)"', xprop('-id', wid, 'WM_CLASS'))
+            name = klass[-1] if klass else ''
+            eligible = bool(types) and types[0].upper() in self.types \
+                and name.lower() not in self.skip
+            self._meta[wid] = (eligible, name)
+        return self._meta[wid]
+
+    @staticmethod
+    def _states(wid):
+        """All _NET_WM_STATE atoms in one call.
+
+        hidden / fullscreen / above were three separate xprop invocations; each
+        one opens its own X connection, so folding them into a single read cuts
+        two thirds of the per-window cost on every event.
+        """
+        return set(re.findall(r'_NET_WM_STATE_(\w+)',
+                             xprop('-id', wid, '_NET_WM_STATE')))
+
+    def _exempt(self, wid, states):
+        """Windows that must keep their real opacity.
+
+        A fullscreen video loses focus the moment you click anything else, and
+        fading it is never what you want. Always-on-top windows are the browser
+        picture-in-picture case: they are never the focused window, so without
+        this they would sit dimmed permanently.
+        """
+        if self.cfg.get('skip_fullscreen', True) and 'FULLSCREEN' in states:
+            return True
+        if self.cfg.get('skip_above', True) and 'ABOVE' in states:
+            return True
+        return False
+
+    @staticmethod
+    def _desktop(wid):
+        m = re.search(r'=\s*(\d+)', xprop('-id', wid, '_NET_WM_DESKTOP'))
+        return int(m.group(1)) if m else ALL_DESKTOPS
+
+    def _busy_mask(self, clients, current, mons, geo):
+        """Bit per monitor: is a real, visible window actually covering it?
+
+        Measured by overlap area, not by which monitor holds the window's
+        centre. Centre-based assignment gets a window that straddles two
+        screens wrong -- it marks one busy and leaves the other looking empty,
+        even though half the window is sitting on it. Overlap also counts a
+        spanning window on both screens, which is what the eye sees.
+
+        The threshold is why overlap is safe here: client-side decorations add
+        ~60 px of invisible shadow that can spill onto the neighbouring screen,
+        and a sliver like that is far below any sensible fraction of a monitor.
+
+        Workspace filtering falls out of GNOME's workspaces-only-on-primary:
+        only primary-monitor windows carry a real workspace number, and windows
+        on the other screens report "on all workspaces" and so always count --
+        correct, since they are always on show.
+        """
+        mask = 0
+        full = (1 << len(mons)) - 1
+        threshold = max(0.0, min(1.0, float(self.cfg.get('cover_threshold', 0.10))))
+        for wid in clients:
+            eligible, _ = self._describe(wid)
+            if not eligible or 'HIDDEN' in self._states(wid):
+                continue
+            d = self._desktop(wid)
+            if not (d == ALL_DESKTOPS or current is None or d == current):
+                continue
+            rect = geo.get(wid.lower())
+            if not rect:
+                continue
+            wx, wy, ww, wh = rect
+            for i, m in enumerate(mons):
+                overlap_w = min(wx + ww, m['x'] + m['w']) - max(wx, m['x'])
+                overlap_h = min(wy + wh, m['y'] + m['h']) - max(wy, m['y'])
+                if overlap_w <= 0 or overlap_h <= 0:
+                    continue
+                area = m['w'] * m['h']
+                if area and (overlap_w * overlap_h) / area >= threshold:
+                    mask |= 1 << i
+            if mask == full:
+                break
+        return mask
+
+    def _push(self, wid, value, final, flush=True):
+        """Write one opacity value. At full opacity the property is removed
+        rather than set, so mutter may resume unredirecting that window."""
+        value = max(0, min(OPAQUE, int(value)))
+        clear = final and value >= OPAQUE
+        if self._x.ok:
+            if clear:
+                self._x.delete(wid)
+            else:
+                self._x.set_cardinal(wid, value)
+            if flush:
+                self._x.flush()
+        elif clear:
+            xprop('-id', wid, '-remove', '_NET_WM_WINDOW_OPACITY')
+        else:
+            xprop('-id', wid, '-f', '_NET_WM_WINDOW_OPACITY', '32c',
+                  '-set', '_NET_WM_WINDOW_OPACITY', str(value))
+        with self._lock:
+            self._applied[wid] = value
+
+    def _target(self, wid, value):
+        """Ask for an opacity. The animator walks it there; nothing else writes."""
+        with self._lock:
+            same = self._targets.get(wid) == value and self._applied.get(wid) == value
+            self._targets[wid] = value
+        if same:
+            return
+        if self.animate:
+            self._wake.set()
+        else:
+            self._push(wid, value, final=True)
+
+    def _animator(self):
+        """Drive every changing window's opacity on a steady clock.
+
+        Two things make this smooth. Progress is measured against wall time
+        rather than counting frames, so a fade takes exactly `fade_ms` however
+        long any single frame took -- a frame counter drifts the moment a frame
+        runs late. And all of a frame's writes share one XFlush, so the server
+        applies them together instead of tearing across windows.
+
+        Only windows whose value actually differs are touched: on a focus switch
+        that is the window gaining focus and the one losing it, not all of them.
+        """
+        while not self._stop:
+            self._wake.wait(0.5)
+            self._wake.clear()
+            while not self._stop:
+                started = time.monotonic()
+                duration = max(0, int(self.cfg['fade_ms'])) / 1000.0
+                fps = max(10, min(240, int(self.cfg.get('fade_fps', 60))))
+
+                with self._lock:
+                    for wid, target in self._targets.items():
+                        state = self._anim.get(wid)
+                        if state and state[1] == target:
+                            continue
+                        if self._applied.get(wid) == target:
+                            self._anim.pop(wid, None)
+                            continue
+                        self._anim[wid] = (self._applied.get(wid, OPAQUE),
+                                           target, started)
+                    for wid in set(self._anim) - set(self._targets):
+                        self._anim.pop(wid, None)
+
+                    frames = []
+                    for wid, (start, target, begun) in self._anim.items():
+                        progress = 1.0 if duration <= 0 else \
+                            min(1.0, (started - begun) / duration)
+                        eased = 1 - (1 - progress) ** 3     # ease-out cubic
+                        frames.append((wid, start + (target - start) * eased,
+                                       progress >= 1.0))
+
+                if not frames:
+                    break
+                for wid, value, final in frames:
+                    self._push(wid, value, final, flush=False)
+                self._x.flush()
+                with self._lock:
+                    for wid, _value, final in frames:
+                        if final:
+                            self._anim.pop(wid, None)
+                time.sleep(max(0.0, 1.0 / fps - (time.monotonic() - started)))
+
+    def start_animator(self):
+        self.animate = max(0, int(self.cfg['fade_ms'])) > 0
+        if self.animate:
+            threading.Thread(target=self._animator, daemon=True).start()
+
+    def _maybe_rebuild(self):
+        """Re-render composites in the background when the wallpaper changed."""
+        if not self.cfg['auto_rebuild'] or self._rebuilding:
+            return
+        if not self.wallpaper.stale():
+            return
+        self._rebuilding = True
+
+        def work():
+            try:
+                self.wallpaper.building = True
+                self.wallpaper.build()
+            finally:
+                self.wallpaper.building = False
+                self.wallpaper.state = None   # force a re-set with fresh files
+                self._rebuilding = False
+                self._wake.set()
+                self.apply()
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def watch_config(self):
+        """Re-read the config file when it changes, so the preferences window
+        never has to restart the service to apply a setting."""
+        def work():
+            last = None
+            while not self._stop:
+                try:
+                    stamp = os.path.getmtime(CONFIG)
+                except OSError:
+                    stamp = None
+                if last is not None and stamp != last:
+                    fresh = load_config()
+                    radius = self.cfg.get('blur_radius')
+                    quality = self.cfg.get('jpeg_quality')
+                    self.cfg.update(fresh)          # Wallpaper shares this dict
+                    self.types = {t.upper() for t in self.cfg['types']}
+                    self.skip = {c.lower() for c in self.cfg['skip_classes']}
+                    self.animate = max(0, int(self.cfg['fade_ms'])) > 0
+                    if (radius, quality) != (self.cfg['blur_radius'],
+                                             self.cfg['jpeg_quality']):
+                        self.wallpaper.state = None
+                    self._maybe_rebuild()
+                    self.apply()
+                last = stamp
+                time.sleep(1.5)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def watch_wallpaper(self):
+        """Adopt a wallpaper the user picks elsewhere, then re-render.
+
+        HydraPaper and Settings both just write picture-uri, so listening to it
+        is enough -- no polling, and no need to run anything by hand.
+        """
+        if not self.cfg['auto_rebuild']:
+            return
+
+        def work():
+            # `gsettings monitor` takes at most ONE key; naming two makes it
+            # print usage and exit, so the watcher silently never ran. Watch the
+            # whole schema and let the regex below pick out the picture-uri lines.
+            proc = subprocess.Popen(
+                ['gsettings', 'monitor', Wallpaper.SCHEMA],
+                stdout=subprocess.PIPE, text=True)
+            for line in proc.stdout:
+                if self._stop:
+                    break
+                m = re.search(r"picture-uri(-dark)?:\s*'?(?:file://)?([^']+)'?", line)
+                if not m:
+                    continue
+                kind = 'dark' if m.group(1) else 'light'
+                path = m.group(2).strip()
+                if self.wallpaper.adopt(kind, path):
+                    self.wallpaper.state = None
+                    self._maybe_rebuild()
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def apply(self):
+        active = root_ids('_NET_ACTIVE_WINDOW')
+        active = active[0] if active else None
+        clients = root_ids('_NET_CLIENT_LIST')
+        current = root_int('_NET_CURRENT_DESKTOP')
+
+        v_focused = round(OPAQUE * max(10, min(100, int(self.cfg['focused']))) / 100)
+        v_unfocused = round(OPAQUE * max(10, min(100, int(self.cfg['unfocused']))) / 100)
+
+        # Opacity first -- it is what the eye notices immediately.
+        for wid in clients:
+            if not self._describe(wid)[0]:
+                continue
+            states = self._states(wid)
+            if self._exempt(wid, states):
+                self._target(wid, OPAQUE)
+            else:
+                self._target(wid, v_focused if wid == active else v_unfocused)
+
+        with self._lock:
+            for wid in set(self._meta) - set(clients):
+                self._meta.pop(wid, None)
+                self._applied.pop(wid, None)
+                self._targets.pop(wid, None)
+
+        self._maybe_rebuild()
+
+        if not self.cfg['adaptive_wallpaper']:
+            return
+        # Read the layout fresh every time. Caching it meant that after a
+        # monitor was added, removed or moved, masks were still computed against
+        # the old rectangles -- bits pointing at screens that no longer existed.
+        mons = monitors()
+        if not mons:
+            return
+        if not self.cfg['per_monitor_wallpaper'] or len(mons) > MAX_MONITORS:
+            mask = 1 if self._busy_mask(clients, current, mons,
+                                        window_geometry(clients)) else 0
+        else:
+            mask = self._busy_mask(clients, current, mons,
+                                   window_geometry(clients))
+        self.wallpaper.set(mask)
+
+    def restore(self):
+        self._stop = True
+        self._wake.set()
+        with self._lock:
+            self._targets.clear()
+            self._anim.clear()
+        for wid in list(self._applied):
+            xprop('-id', wid, '-remove', '_NET_WM_WINDOW_OPACITY')
+        self._applied.clear()
+        self.wallpaper.set(0)
+
+
+USAGE = """usage: focus-opacity [OPTION]
+  (no option)  watch focus/windows and apply both effects until killed
+  --once       apply once and exit
+  --restore    clear opacity, restore the untouched wallpaper, exit
+  --reblur     rebuild every per-monitor composite, exit
+  --status     show what it would do right now, exit
+  --help       this text
+"""
+
+
+def main():
+    argv = set(sys.argv[1:])
+    if {'-h', '--help'} & argv:
+        print(__doc__)
+        print(USAGE)
+        print(f'config: {CONFIG}\nimages: {WPDIR}')
+        return 0
+
+    cfg = load_config()
+    fader = Fader(cfg)
+
+    if '--reblur' in argv:
+        made = fader.wallpaper.build(force=True, verbose=True)
+        print(f'  {len(made)} composites written' if made else '  nothing to do')
+        return 0
+
+    if '--restore' in argv:
+        for wid in root_ids('_NET_CLIENT_LIST'):
+            xprop('-id', wid, '-remove', '_NET_WM_WINDOW_OPACITY')
+        fader.wallpaper.set(0)
+        return 0
+
+    if '--status' in argv:
+        mons = monitors()
+        clients = root_ids('_NET_CLIENT_LIST')
+        current = root_int('_NET_CURRENT_DESKTOP')
+        geo = window_geometry(clients)
+        mask = fader._busy_mask(clients, current, mons, geo)
+        print(f'workspace {current}, {len(clients)} windows, mask {mask}')
+
+        blame = {}
+        threshold = max(0.0, min(1.0, float(cfg.get('cover_threshold', 0.10))))
+        for wid in clients:
+            eligible, name = fader._describe(wid)
+            states = fader._states(wid)
+            desktop = fader._desktop(wid)
+            rect = geo.get(wid.lower())
+            if not eligible or 'HIDDEN' in states or not rect:
+                continue
+            if not (desktop == ALL_DESKTOPS or current is None
+                    or desktop == current):
+                continue
+            wx, wy, ww, wh = rect
+            for i, m in enumerate(mons):
+                ow = min(wx + ww, m['x'] + m['w']) - max(wx, m['x'])
+                oh = min(wy + wh, m['y'] + m['h']) - max(wy, m['y'])
+                area = m['w'] * m['h']
+                if ow <= 0 or oh <= 0 or not area:
+                    continue
+                pct = (ow * oh) / area
+                if pct >= threshold:
+                    tag = name + (' [sticky]' if desktop == ALL_DESKTOPS else '')
+                    blame.setdefault(i, []).append(f'{tag} covers {pct*100:.0f}%')
+
+        for i, m in enumerate(mons):
+            busy = bool(mask & (1 << i))
+            role = 'primary' if m['primary'] else '       '
+            print(f'  {m["name"]:10s} {role} {m["w"]}x{m["h"]}+{m["x"]}+{m["y"]}'
+                  f'  ->  {"BLURRED" if busy else "sharp"}')
+            for who in blame.get(i, []):
+                print(f'{"":24s}   {who}')
+            if not busy:
+                print(f'{"":24s}   nothing visible on it')
+        return 0
+
+    fader.wallpaper.build()
+
+    if '--once' in argv:
+        fader.apply()
+        return 0
+
+    def bye(_sig, _frm):
+        fader.restore()
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, bye)
+    signal.signal(signal.SIGINT, bye)
+    fader.start_animator()
+    fader.watch_wallpaper()
+    fader.watch_config()
+    fader.apply()
+
+    spy = subprocess.Popen(
+        ['xprop', '-root', '-spy',
+         '_NET_ACTIVE_WINDOW', '_NET_CLIENT_LIST',
+         '_NET_CLIENT_LIST_STACKING', '_NET_CURRENT_DESKTOP',
+         # geometry/workarea move when a monitor is plugged in, unplugged or
+         # rearranged; without these a layout change goes unnoticed until the
+         # next unrelated window event.
+         '_NET_DESKTOP_GEOMETRY', '_NET_WORKAREA'],
+        stdout=subprocess.PIPE, text=True)
+
+    pending = None
+    delay = max(0, int(cfg['debounce_ms'])) / 1000.0
+    try:
+        for _line in spy.stdout:
+            if pending and pending.is_alive():
+                continue
+            pending = threading.Timer(delay, fader.apply)
+            pending.daemon = True
+            pending.start()
+    finally:
+        spy.terminate()
+        fader.restore()
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

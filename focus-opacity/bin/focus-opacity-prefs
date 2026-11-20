@@ -1,0 +1,259 @@
+#!/usr/bin/env python3
+"""Preferences window for focus-opacity.
+
+The effects are a background service rather than a GNOME Shell extension --
+per-window transparency needs an X property that an extension cannot set -- so
+they have no page in the Extensions app. This is that page. It writes the same
+JSON the service reads, and the service picks changes up within a second or two,
+so nothing here needs a restart.
+"""
+
+import json
+import os
+import subprocess
+
+import gi
+gi.require_version('Gtk', '4.0')
+gi.require_version('Adw', '1')
+from gi.repository import Adw, Gio, GLib, Gtk   # noqa: E402
+
+CONFIG = os.path.expanduser('~/.config/focus-opacity.json')
+DAEMON = os.path.expanduser('~/.local/bin/focus-opacity')
+UNIT = 'focus-opacity.service'
+
+
+def read_config():
+    try:
+        with open(CONFIG) as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return {}
+
+
+def write_config(cfg):
+    tmp = CONFIG + '.tmp'
+    with open(tmp, 'w') as fh:
+        json.dump(cfg, fh, indent=2)
+        fh.write('\n')
+    os.replace(tmp, CONFIG)
+
+
+def systemctl(*args):
+    return subprocess.run(['systemctl', '--user', *args],
+                          capture_output=True, text=True)
+
+
+def service_active():
+    return systemctl('is-active', UNIT).stdout.strip() == 'active'
+
+
+def service_enabled():
+    return systemctl('is-enabled', UNIT).stdout.strip() == 'enabled'
+
+
+class Window(Adw.ApplicationWindow):
+    def __init__(self, app):
+        super().__init__(application=app, title='Window Effects',
+                         default_width=620, default_height=720)
+        self.cfg = read_config()
+        self._writing = False
+
+        # libadwaita here is 1.1, which has no ToolbarView: stack the header bar
+        # and the content in a box and use that as the window content.
+        shell = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        shell.append(Adw.HeaderBar())
+
+        self.toasts = Adw.ToastOverlay()
+        page = Adw.PreferencesPage()
+        page.set_vexpand(True)
+        self.toasts.set_child(page)
+        self.toasts.set_vexpand(True)
+        shell.append(self.toasts)
+        self.set_content(shell)
+
+        # ---- service ----
+        g = Adw.PreferencesGroup(
+            title='Service',
+            description='Fades unfocused windows and blurs each monitor’s '
+                        'wallpaper while something covers that screen.')
+        page.add(g)
+
+        self.run_row = Adw.ActionRow(
+            title='Effects running',
+            subtitle='Turning this off clears all fading and restores the sharp wallpaper')
+        self.run_sw = Gtk.Switch(valign=Gtk.Align.CENTER, active=service_active())
+        self.run_sw.connect('notify::active', self.on_running)
+        self.run_row.add_suffix(self.run_sw)
+        self.run_row.set_activatable_widget(self.run_sw)
+        g.add(self.run_row)
+
+        boot_row = Adw.ActionRow(title='Start at login')
+        self.boot_sw = Gtk.Switch(valign=Gtk.Align.CENTER, active=service_enabled())
+        self.boot_sw.connect('notify::active', self.on_boot)
+        boot_row.add_suffix(self.boot_sw)
+        boot_row.set_activatable_widget(self.boot_sw)
+        g.add(boot_row)
+
+        # ---- transparency ----
+        g = Adw.PreferencesGroup(title='Transparency')
+        page.add(g)
+        self.unfocused = self._spin(g, 'Unfocused windows',
+                                    'Opacity in percent for every window that is not focused',
+                                    'unfocused', 10, 100, 1, 80)
+        self.focused = self._spin(g, 'Focused window',
+                                  'Normally 100 — lower it to fade the active window too',
+                                  'focused', 10, 100, 1, 100)
+        self.fade = self._spin(g, 'Fade duration',
+                               'Milliseconds for the cross-fade; 0 switches instantly',
+                               'fade_ms', 0, 1000, 20, 180)
+        self.fps = self._spin(g, 'Smoothness',
+                              'Frames per second while fading. 60 matches the display',
+                              'fade_fps', 24, 144, 6, 60)
+
+        self.skipfs = self._switch(g, 'Never fade fullscreen windows',
+                                   'Keeps fullscreen video and games at full opacity',
+                                   'skip_fullscreen', True)
+        self.skipabove = self._switch(g, 'Never fade always-on-top windows',
+                                      'Covers picture-in-picture players, which are '
+                                      'never the focused window',
+                                      'skip_above', True)
+
+        # ---- wallpaper ----
+        g = Adw.PreferencesGroup(
+            title='Wallpaper blur',
+            description='GNOME can show only one image across all monitors, so a '
+                        'blurred copy is pre-rendered for every combination of busy '
+                        'screens. Switching is then instant.')
+        page.add(g)
+
+        self.adaptive = self._switch(g, 'Blur while covered',
+                                     'Sharp when nothing is on the screen, blurred when there is',
+                                     'adaptive_wallpaper', True)
+        self.permon = self._switch(g, 'Each monitor separately',
+                                   'Off means one decision for every screen at once',
+                                   'per_monitor_wallpaper', True)
+        self.autorebuild = self._switch(g, 'Follow wallpaper changes',
+                                        'Re-render automatically when you pick a new wallpaper',
+                                        'auto_rebuild', True)
+        self.radius = self._spin(g, 'Blur strength',
+                                 'Gaussian radius. Changing this re-renders the images',
+                                 'blur_radius', 2, 60, 2, 16)
+
+        rebuild = Adw.ActionRow(
+            title='Re-render now',
+            subtitle='Use this if the wallpaper changed and the blur looks wrong')
+        btn = Gtk.Button(label='Re-render', valign=Gtk.Align.CENTER)
+        btn.connect('clicked', self.on_rebuild)
+        rebuild.add_suffix(btn)
+        g.add(rebuild)
+
+        # ---- exceptions ----
+        g = Adw.PreferencesGroup(
+            title='Never fade these apps',
+            description='Comma-separated window classes. Find one by running '
+                        '“xprop WM_CLASS” and clicking the window.')
+        page.add(g)
+        row = Adw.ActionRow(title='Window classes')
+        entry = Gtk.Entry(hexpand=True, valign=Gtk.Align.CENTER,
+                          placeholder_text='Nxplayer.bin, mpv',
+                          text=', '.join(self.cfg.get('skip_classes', []) or []))
+        entry.connect('changed', self.on_skip)
+        row.add_suffix(entry)
+        row.set_activatable_widget(entry)
+        g.add(row)
+
+        # ---- status ----
+        g = Adw.PreferencesGroup(title='Right now')
+        page.add(g)
+        self.status = Adw.ActionRow(title='Monitors', subtitle='checking…')
+        self.status.set_subtitle_lines(0)
+        g.add(self.status)
+        self.refresh_status()
+        GLib.timeout_add_seconds(3, self.refresh_status)
+
+    # ---------- helpers ----------
+    def _spin(self, group, title, subtitle, key, lo, hi, step, default):
+        row = Adw.ActionRow(title=title, subtitle=subtitle)
+        spin = Gtk.SpinButton(
+            adjustment=Gtk.Adjustment(lower=lo, upper=hi, step_increment=step,
+                                      page_increment=step * 5),
+            valign=Gtk.Align.CENTER, numeric=True)
+        spin.set_value(self.cfg.get(key, default))
+        spin.connect('value-changed', lambda w: self.store(key, int(w.get_value())))
+        row.add_suffix(spin)
+        row.set_activatable_widget(spin)
+        group.add(row)
+        return spin
+
+    def _switch(self, group, title, subtitle, key, default):
+        row = Adw.ActionRow(title=title, subtitle=subtitle)
+        sw = Gtk.Switch(valign=Gtk.Align.CENTER,
+                        active=bool(self.cfg.get(key, default)))
+        sw.connect('notify::active', lambda w, _p: self.store(key, w.get_active()))
+        row.add_suffix(sw)
+        row.set_activatable_widget(sw)
+        group.add(row)
+        return sw
+
+    def store(self, key, value):
+        if self._writing:
+            return
+        self.cfg = read_config()
+        self.cfg[key] = value
+        write_config(self.cfg)
+
+    def toast(self, text):
+        self.toasts.add_toast(Adw.Toast(title=text, timeout=3))
+
+    # ---------- handlers ----------
+    def on_running(self, sw, _p):
+        systemctl('start' if sw.get_active() else 'stop', UNIT)
+        self.toast('Effects on' if sw.get_active() else 'Effects off')
+
+    def on_boot(self, sw, _p):
+        systemctl('enable' if sw.get_active() else 'disable', UNIT)
+
+    def on_skip(self, entry):
+        names = [s.strip() for s in entry.get_text().split(',') if s.strip()]
+        self.store('skip_classes', names)
+
+    def on_rebuild(self, btn):
+        btn.set_sensitive(False)
+        self.toast('Re-rendering…')
+
+        def done(proc, result):
+            try:
+                proc.wait_check_finish(result)
+                self.toast('Wallpaper re-rendered')
+            except GLib.Error as exc:
+                self.toast(f'Re-render failed: {exc.message}')
+            btn.set_sensitive(True)
+
+        Gio.Subprocess.new([DAEMON, '--reblur'],
+                           Gio.SubprocessFlags.STDOUT_SILENCE
+                           | Gio.SubprocessFlags.STDERR_SILENCE) \
+            .wait_check_async(None, done)
+
+    def refresh_status(self):
+        self.run_sw.set_active(service_active())
+        try:
+            out = subprocess.run([DAEMON, '--status'], capture_output=True,
+                                 text=True, timeout=20).stdout.strip()
+        except (OSError, subprocess.TimeoutExpired):
+            out = ''
+        lines = [l.strip() for l in out.splitlines()[1:] if l.strip()]
+        self.status.set_subtitle('\n'.join(lines) if lines
+                                 else 'no monitor information')
+        return True
+
+
+class App(Adw.Application):
+    def __init__(self):
+        super().__init__(application_id='local.focus.opacity.Prefs')
+
+    def do_activate(self):
+        Window(self).present()
+
+
+if __name__ == '__main__':
+    App().run(None)

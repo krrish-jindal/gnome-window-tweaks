@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Window Effects
+Comment=Unfocused-window fading and per-monitor wallpaper blur
+Exec=@HOME@/.local/bin/focus-opacity-prefs
+Icon=preferences-desktop-wallpaper
+Categories=GNOME;Settings;DesktopSettings;
+Keywords=transparency;opacity;blur;wallpaper;fade;
+StartupNotify=true
