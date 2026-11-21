@@ -7,7 +7,7 @@ const src = fs.readFileSync(process.argv[2], 'utf8');
 const names = ['splitSpan', 'splitSpanWeighted', 'autoTileStructure', 'autoTileGap', 'evenLayoutState',
     'autoTileRects', 'isTileCandidate', 'isBlacklisted', 'retileAll', 'autoTileKey', 'swapAutoTileOrder',
     'findSwapTarget', 'swapDragMoved', 'stopSwapDrag', 'updateSwapHighlight', 'beginSwapDrag', 'endSwapDrag',
-    'structureViolation', 'scheduleVerify', 'verifyTiles'];
+    'structureViolation', 'preferredRowCounts', 'scheduleVerify', 'verifyTiles'];
 let code = '';
 for (const n of names) {
     const m = new RegExp(`^function ${n}\\(`, 'm').exec(src);

@@ -52,10 +52,11 @@ Modified `extension.js`:
 
 Modified `extension.js`:
 
-- **Portrait monitors now stack every window** in its own full-width row. The previous
-  portrait layout put two windows side by side for three or more windows, which is too
-  narrow for most applications.
+- **Portrait layout rule changed.** Up to three windows stack in full-width rows; from four
+  up they pair two to a row (4 = 2x2, 5 = 2+2+1). The earlier portrait layout put two windows
+  side by side as soon as there were three, which is too narrow for most applications.
 - **Minimum sizes.** After a layout the extension compares each window's real size with its
   tile; a window that is still larger has hit its application's minimum size. That minimum
-  is remembered and the next layout picks the column/row count in which the windows fit,
+  is remembered and the next layout picks the split into columns/rows in which the windows
+  fit (for example, giving two too-wide windows a row each while the rest still pair up),
   instead of letting them overlap.

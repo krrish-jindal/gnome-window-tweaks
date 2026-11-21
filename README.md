@@ -24,15 +24,18 @@ Everything upstream WinTile does (`Super`+arrows tiling, grid previews, gaps), p
   **`Super`+`Shift`+`T`** (or the `auto-tile` setting).
 - **Follows monitor orientation.**
   - *Landscape:* windows go **side by side** (left/right).
-  - *Portrait:* windows go **stacked** (top/bottom), each one full width. A portrait screen is
-    too narrow to put windows beside each other, and most apps refuse to be that narrow.
+  - *Portrait:* up to 3 windows go **stacked** (top/bottom), each full width; from 4 up they
+    **pair up two to a row** (4 is a 2x2 grid, 5 is 2+2+1, 6 is 2+2+2). Never more than two
+    side by side: a portrait screen is too narrow for that.
   - Rotating a monitor re-lays it out straight away.
 - **Respects minimum window sizes.** Many apps cannot be made smaller than a minimum (a
   Chromium-based browser is about 580 px wide), and a tile smaller than that makes the window
   spill over its neighbour. After each layout WinTile checks whether any window is still bigger
-  than its tile; if so it remembers that window's minimum and re-lays out with a column or row
-  count in which everything fits (for example, stacking instead of two columns). With no such
-  windows nothing changes.
+  than its tile; if so it remembers that window's minimum and re-lays out so everything fits.
+  On a portrait screen that means two windows that are too wide to share a row (two Brave
+  windows are each at least ~580 px) get a row each while the others still pair up; on a
+  landscape screen it can mean stacking instead of two columns. With no such windows nothing
+  changes.
 - **Drag to swap.** Drag a tiled window by its title bar onto another tile on the **same
   monitor** and drop it: the two trade places. A soft blue outline shows the tile you would
   swap with. Dropped anywhere else (empty desktop, another monitor, over a dialog) the
@@ -259,7 +262,7 @@ journalctl --user -u focus-opacity.service -f
 The WinTile tests run the **real** layout, resize and drag-swap functions from
 `extension.js` against fake windows and a fake pointer. They check, among other things, that
 landscape output is identical to the version before orientation support
-(`tests/fixtures/`), that portrait is always a full-width stack, that windows with a minimum
+(`tests/fixtures/`), that portrait stacks up to 3 and pairs from 4, that windows with a minimum
 size larger than their tile are re-laid out instead of overlapping, and that swaps keep
 hand-resized sizes.
 The install test runs `install.sh` / `uninstall.sh` in a throw-away `HOME` with stand-ins for

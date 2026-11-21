@@ -6,7 +6,7 @@ const fs = require('fs');
 const vm = require('vm');
 
 const src = fs.readFileSync(process.argv[2], 'utf8');
-const names = ['splitSpan', 'splitSpanWeighted', 'autoTileStructure', 'structureViolation', 'autoTileGap',
+const names = ['splitSpan', 'splitSpanWeighted', 'autoTileStructure', 'preferredRowCounts', 'structureViolation', 'autoTileGap',
     'evenLayoutState', 'autoTileRects', 'isTileCandidate', 'isBlacklisted', 'retileAll', 'autoTileKey',
     'scheduleVerify', 'verifyTiles'];
 let code = '';
@@ -69,28 +69,52 @@ const anyOverlap = ws => ws.some((a, i) => ws.slice(i + 1).some(b => overlaps(a,
 const run = (env, s) => vm.runInContext(s, env);
 
 // ---- 1. structure choice ----
-console.log('1. lane count follows minimum sizes');
+console.log('1. how windows are split into lanes, with and without known minimum sizes');
 {
     const env = makeEnv([]);
     const land = monInfo(0, 0, 1920, 1080), port = monInfo(0, 0, 1080, 1920);
-    const lanes = (m, n, mins) => env.autoTileStructure(m, n, mins).columns;
+    const split = (m, n, mins) => env.autoTileStructure(m, n, mins).rowCounts.join(',');
+    const none = n => Array(n).fill(undefined);
 
-    ok(lanes(land, 2) === 2 && lanes(land, 3) === 2 && lanes(land, 5) === 2, 'landscape with no minimums: 2 columns as before');
-    ok(lanes(port, 2) === 2 && lanes(port, 3) === 3 && lanes(port, 5) === 5, 'portrait with no minimums: every window its own row');
-    ok(lanes(land, 4, [undefined, undefined, undefined, undefined]) === 2, 'all-unknown minimums change nothing');
+    // landscape is unchanged: spread over at most 2 columns
+    ok(split(land, 2) === '1,1' && split(land, 3) === '2,1' && split(land, 5) === '3,2', 'landscape with no minimums: columns as before');
+    // portrait: up to 3 stack, then two to a row
+    const wantPortrait = {1: '1', 2: '1,1', 3: '1,1,1', 4: '2,2', 5: '2,2,1', 6: '2,2,2', 7: '2,2,2,1', 8: '2,2,2,2'};
+    for (const n of Object.keys(wantPortrait))
+        ok(split(port, +n) === wantPortrait[n], `portrait n=${n}: want ${wantPortrait[n]}, got ${split(port, +n)}`);
+    ok(split(port, 4, none(4)) === '2,2', 'all-unknown minimums change nothing');
 
     // landscape, two windows that need 1200px: two 951px columns cannot hold them -> stack instead
-    ok(lanes(land, 2, [{w: 1200, h: 0}, {w: 1200, h: 0}]) === 1, 'landscape: 1200px-wide windows should stack, not sit in 951px columns');
-    // minimums that already fit leave the preferred layout alone
-    ok(lanes(land, 2, [{w: 600, h: 300}, {w: 600, h: 300}]) === 2, 'landscape: minimums that fit keep two columns');
-    // portrait Brave-like windows (wide minimum, short) fit full width
-    ok(lanes(port, 3, [{w: 578, h: 110}, {w: 578, h: 110}, {w: 373, h: 100}]) === 3, 'portrait: 578px-wide minimums fit a full-width stack');
-    // portrait: tall minimums cannot all stack -> fewer rows
-    ok(lanes(port, 4, Array(4).fill({w: 0, h: 600})) === 3, 'portrait: 4 windows needing 600px height fall back to 3 rows');
-    // impossible: choose the least-bad, deterministic, never throw
+    ok(split(land, 2, [{w: 1200, h: 0}, {w: 1200, h: 0}]) === '2', 'landscape: 1200px-wide windows should stack, not sit in 951px columns');
+    ok(split(land, 2, [{w: 600, h: 300}, {w: 600, h: 300}]) === '1,1', 'landscape: minimums that fit keep two columns');
+    // portrait: Brave-like windows (578 wide) fit a full-width stack of 3
+    ok(split(port, 3, [{w: 578, h: 110}, {w: 578, h: 110}, {w: 373, h: 100}]) === '1,1,1', 'portrait: 578px-wide minimums fit a full-width stack');
+
+    // THE REPORTED CASE: 4 windows in portrait. Normal windows pair up as a 2x2 grid ...
+    ok(split(port, 4, Array(4).fill({w: 373, h: 100})) === '2,2', 'portrait n=4 with narrow-enough windows: 2x2 grid');
+    // ... but two 578px-wide windows (Brave) cannot share a 1080px row (2x531 < 2x578): give them a row each,
+    // and let the two narrow windows still pair up.
+    const wide = {w: 578, h: 110}, narrow = {w: 373, h: 100};
+    ok(split(port, 4, [wide, wide, narrow, narrow]) === '1,1,2', `portrait n=4, two wide + two narrow: want 1,1,2, got ${split(port, 4, [wide, wide, narrow, narrow])}`);
+    ok(split(port, 4, [wide, narrow, wide, narrow]) === '1,1,1,1' || env.structureViolation(port, env.autoTileStructure(port, 4, [wide, narrow, wide, narrow]), [wide, narrow, wide, narrow]) === 0,
+        'portrait n=4 interleaved wide/narrow: must still be a zero-overlap layout');
+    // all four wide: nothing can pair up, so a full stack is the only fit
+    ok(split(port, 4, Array(4).fill(wide)) === '1,1,1,1', 'portrait n=4, all wide: full stack');
+    // every chosen layout really has zero shortfall when one exists
+    for (const mins of [[wide, wide, narrow, narrow], [narrow, wide, wide, narrow], [wide, narrow, narrow, wide], Array(4).fill(wide)]) {
+        const st = env.autoTileStructure(port, 4, mins);
+        ok(env.structureViolation(port, st, mins) === 0, `portrait n=4 ${JSON.stringify(mins.map(m => m.w))}: layout [${st.rowCounts}] should fit with zero shortfall`);
+    }
+    // tall minimums that two rows cannot hold (2 x 951px) -> fewer, taller lanes
+    ok(split(port, 4, Array(4).fill({w: 0, h: 1000})) === '4', 'portrait: 4 windows each needing 1000px of height leave a single lane');
+
+    // impossible: least-bad, deterministic, never throws
     const bad = env.autoTileStructure(land, 3, Array(3).fill({w: 5000, h: 5000}));
-    ok(bad.columns >= 1 && bad.columns <= 3 && bad.rowCounts.reduce((a, b) => a + b, 0) === 3, 'impossible minimums still give a valid structure');
-    console.log('  landscape keeps columns, portrait stacks, and minimums that do not fit change the lane count');
+    ok(bad.rowCounts.length >= 1 && bad.rowCounts.reduce((a, b) => a + b, 0) === 3, 'impossible minimums still give a valid structure');
+    // more than 10 windows falls back to even splits rather than enumerating thousands
+    const many = env.autoTileStructure(port, 14, Array(14).fill({w: 300, h: 100}));
+    ok(many.rowCounts.reduce((a, b) => a + b, 0) === 14, 'a 14-window layout is still valid');
+    console.log('  landscape keeps columns; portrait stacks to 3 then pairs; wide windows get their own row while the rest pair up');
 }
 
 // ---- 2. the full cycle: place -> window clamps -> learn -> relayout -> no overlap ----
@@ -122,6 +146,37 @@ console.log('3. portrait 1080x1920: two windows with a 578px minimum width + one
     ok(env.retileScheduled === 0, 'nothing to learn: the stack already fits');
     ok([Y1, Y2, T].every(w => w.rect.width === 1080 - 2 * G), 'every window should be full width');
     console.log('  stacked at full width, no overlap, nothing to relearn');
+}
+
+// ---- 3b. the reported case: FOUR windows in portrait, two of them Brave-like ----
+console.log('3b. portrait 1080x1920, four windows, two with a 578px minimum width');
+{
+    const env = makeEnv([monInfo(1920, 0, 1080, 1920)]);
+    const Y1 = win(env, 'brave', {w: 578, h: 110}), Y2 = win(env, 'brave', {w: 578, h: 110});
+    const T = win(env, 'term', {w: 373, h: 100}), O = win(env, 'other', {w: 300, h: 100});
+    env.retileAll();
+    ok(env.autoTileStructure(monInfo(1920, 0, 1080, 1920), 4).rowCounts.join() === '2,2', 'precondition: the unaware layout is the 2x2 grid');
+    ok(overlaps(Y1, Y2), 'precondition: in that grid the two 578px windows collide in a 531px tile');
+    env.verifyTiles();
+    ok(Y1.wintileMin && Y2.wintileMin && !T.wintileMin && !O.wintileMin,
+        `only the two wide windows should learn a minimum: ${JSON.stringify([Y1.wintileMin, Y2.wintileMin, T.wintileMin, O.wintileMin])}`);
+    ok(env.retileScheduled === 1, 'exactly one relayout should be requested');
+    env.retileAll();
+    ok(!anyOverlap([Y1, Y2, T, O]), 'after the relayout nothing overlaps');
+    ok(Y1.rect.width === 1080 - 2 * G && Y2.rect.width === 1080 - 2 * G && Y1.rect.y < Y2.rect.y, 'the wide windows get a full-width row each');
+    ok(T.rect.y === O.rect.y && T.rect.x < O.rect.x && T.rect.y > Y2.rect.y, 'the two narrow windows still sit side by side, below them');
+    env.retileScheduled = 0; env.verifyTiles();
+    ok(env.retileScheduled === 0, 'and the layout is stable');
+    console.log('  2x2 first, the two wide windows are learned, then: row, row, and a side-by-side pair');
+
+    // four ordinary windows: a real 2x2 grid, nothing to learn
+    const env2 = makeEnv([monInfo(1920, 0, 1080, 1920)]);
+    const ws = [1, 2, 3, 4].map(i => win(env2, 'app' + i, {w: 373, h: 100}));
+    env2.retileAll(); env2.verifyTiles();
+    ok(!anyOverlap(ws) && env2.retileScheduled === 0, 'four ordinary windows: no overlap, nothing to relearn');
+    ok(ws[0].rect.y === ws[1].rect.y && ws[2].rect.y === ws[3].rect.y && ws[0].rect.x < ws[1].rect.x && ws[0].rect.y < ws[2].rect.y,
+        'four ordinary windows form a 2x2 grid (left/right, then left/right)');
+    console.log('  four ordinary windows: a 2x2 grid, left/right then left/right');
 }
 
 // ---- 4. when NOT to learn ----

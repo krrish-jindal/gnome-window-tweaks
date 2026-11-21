@@ -6,8 +6,8 @@ const vm = require('vm');
 function load(path, cfg) {
     const src = fs.readFileSync(path, 'utf8');
     const names = ['splitSpan', 'splitSpanWeighted', 'autoTileStructure', 'autoTileGap',
-        'evenLayoutState', 'autoTileRects', 'shiftBoundary', 'applyManualResize', 'structureViolation'];
-    const optional = ['structureViolation'];   // absent from the pre-orientation fixture
+        'evenLayoutState', 'autoTileRects', 'shiftBoundary', 'applyManualResize', 'structureViolation', 'preferredRowCounts'];
+    const optional = ['structureViolation', 'preferredRowCounts'];   // absent from the pre-orientation fixture
     let code = '';
     for (const n of names) {
         const m = new RegExp(`^function ${n}\\(`, 'm').exec(src);
@@ -89,14 +89,21 @@ for (let n = 1; n <= 7; n++) {
 }
 let l = layout(NEW, pm, 2).rects;
 ok(l[0].x === l[1].x && l[0].w === l[1].w && l[0].y < l[1].y, 'portrait n=2 is not a top/bottom stack');
-// Portrait is a pure stack: every window gets its own full-width row, whatever the count.
-for (let n = 1; n <= 7; n++) {
-    l = layout(NEW, pm, n).rects;
-    ok(l.every(r => r.x === l[0].x && r.w === l[0].w && r.w === pm.width - 2 * G),
-        `portrait n=${n}: every window should be full width`);
-    ok(l.every((r, i) => i === 0 || r.y > l[i - 1].y), `portrait n=${n}: rows should run top to bottom`);
+// Portrait: up to 3 windows stack full width; from 4 up they pair two to a row.
+const wantPortrait = {1: '1', 2: '1,1', 3: '1,1,1', 4: '2,2', 5: '2,2,1', 6: '2,2,2', 7: '2,2,2,1'};
+for (const n of Object.keys(wantPortrait)) {
+    const {st, rects} = layout(NEW, pm, +n);
+    ok(st.rowCounts.join() === wantPortrait[n], `portrait n=${n}: rows should be [${wantPortrait[n]}], got [${st.rowCounts}]`);
+    if (+n <= 3) {
+        ok(rects.every(r => r.x === rects[0].x && r.w === pm.width - 2 * G), `portrait n=${n}: every window should be full width`);
+        ok(rects.every((r, i) => i === 0 || r.y > rects[i - 1].y), `portrait n=${n}: rows should run top to bottom`);
+    }
 }
-console.log('  portrait n=1..7 is always a full-width stack (never side by side)');
+l = layout(NEW, pm, 4).rects;
+ok(l[0].y === l[1].y && l[2].y === l[3].y && l[0].y < l[2].y && l[0].x < l[1].x && l[0].x === l[2].x && l[1].x === l[3].x,
+    'portrait n=4 should be a 2x2 grid');
+ok(l.every(r => r.w < pm.width / 2 && r.h > 700), 'portrait n=4 tiles should be half width and roughly half height');
+console.log('  portrait: 1-3 windows stack full width, 4 is a 2x2 grid, 5 is 2,2,1 ... and never more than 2 side by side');
 const lm = mon(0, 0, 1920, 1080);
 l = layout(NEW, lm, 2).rects;
 ok(l[0].y === l[1].y && l[0].x < l[1].x && l[0].h === l[1].h, 'landscape n=2 is not a left/right split');
@@ -125,17 +132,15 @@ resizeCase('landscape n=2: drag shared (right) edge +100 -> left window 100px wi
 resizeCase('portrait n=2: drag shared (bottom) edge +100 -> top window 100px taller', pm, 2, 0,
     a => { a.height += 100; },
     (app, o, nw, all, C) => { ok(Math.abs(nw.h - (o.h + 100)) <= 2, `portrait grew by ${nw.h - o.h}`); ok(nw.w === o.w, 'width changed'); ok(C.retile, 'no retile'); ok(!app.wintileFloat, 'floated'); ok(all[1].y >= nw.y + nw.h + G, 'neighbour did not follow'); });
-// 600px-tall minimums cannot fit 4 stacked rows on a 1920px screen, so the layout falls back to 3 rows
-// ([2,1,1]) and the top row holds two windows side by side: the case that exercises the item axis.
-const tall = Array.from({length: 4}, () => ({w: 0, h: 600}));
-resizeCase('portrait n=4 forced to 3 rows by 600px-tall minimums: drag a top-row shared (right) edge +80 -> 80px wider', pm, 4, 0,
+// n=4 portrait is a 2x2 grid, so the top-left window has a neighbour on its right: the item axis.
+resizeCase('portrait n=4 (2x2): drag a top-row shared (right) edge +80 -> 80px wider', pm, 4, 0,
     a => { a.width += 80; },
     (app, o, nw, all, C) => {
-        ok(C.autoTileStructure(pm, 4, tall).rowCounts.join() === '2,1,1', 'precondition: rows should be [2,1,1]');
+        ok(C.autoTileStructure(pm, 4).rowCounts.join() === '2,2', 'precondition: rows should be [2,2]');
         ok(Math.abs(nw.w - (o.w + 80)) <= 2, `portrait item widened by ${nw.w - o.w}`);
         ok(nw.h === o.h, 'height changed');
         ok(!app.wintileFloat, 'floated');
-    }, tall);
+    });
 resizeCase('portrait n=2: drag the TOP screen-border edge -> floats the window (as before)', pm, 2, 0,
     a => { a.y += 40; a.height -= 40; },
     (app) => { ok(app.wintileFloat === true, 'should have floated'); });

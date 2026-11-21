@@ -1274,15 +1274,18 @@ function isBlacklisted(app) {
  * transposed on portrait. The names are kept so the weight bookkeeping and the
  * hand-resize code stay a single code path for both orientations.
  *
- * Landscape caps the lanes at the grid's column count. Portrait gives every
- * window its own full-width row: a portrait screen is too narrow to put windows
- * beside each other, and most applications refuse to be that narrow.
+ * Landscape spreads the windows evenly over at most the grid's column count.
+ * Portrait stacks up to three windows full width; from four up, windows pair up
+ * two to a row (4 -> 2x2, 5 -> 2,2,1, 6 -> 2,2,2), because a portrait screen is
+ * too narrow for more than two side by side.
  *
- * Windows with a known minimum size (learned by verifyTiles()) can veto that
- * preference. Every lane count is scored by how far the windows' even tiles
- * would fall short of their minimums, and the preferred count is only replaced
- * by one that is clearly better, or equally good and closer to it. With no known
- * minimums this is simply the preferred layout.
+ * Windows with a known minimum size (learned by verifyTiles()) can veto that.
+ * Every way of splitting the windows into lanes is scored by how far the even
+ * tiles would fall short of the windows' minimums, and the best split wins; among
+ * equally good ones, the one that moves the fewest windows from the preferred
+ * layout. So two windows too wide to share a portrait row are given a row each,
+ * while the others still pair up. With no known minimums this is simply the
+ * preferred layout.
  *
  * @param {object} monitor - monitor info from getMonitorInfo()
  * @param {number} count - number of windows to place
@@ -1291,34 +1294,90 @@ function isBlacklisted(app) {
  */
 function autoTileStructure(monitor, count, mins) {
     const portrait = !!monitor.isPortrait;
-    const preferred = Math.max(1, portrait ? count : Math.min(count, monitor.colCount));
-    const build = lanes => {
-        const perCol = Math.floor(count / lanes);
-        const extra = count - perCol * lanes;
-        const rowCounts = [];
-        for (let c = 0; c < lanes; c++)
-            rowCounts.push(perCol + (c < extra ? 1 : 0));
-        return {columns: lanes, rowCounts, portrait};
+    const wanted = preferredRowCounts(monitor, count);
+    const make = rowCounts => ({columns: rowCounts.length, rowCounts, portrait});
+    const preferred = make(wanted);
+    if (!mins || !mins.some(Boolean))
+        return preferred;
+    if (structureViolation(monitor, preferred, mins) === 0)
+        return preferred;
+
+    // Which lane each window lands in, for measuring how far a split is from the
+    // preferred one.
+    const laneOf = rowCounts => {
+        const lanes = [];
+        rowCounts.forEach((n, lane) => {
+            for (let k = 0; k < n; k++)
+                lanes.push(lane);
+        });
+        return lanes;
+    };
+    const wantedLane = laneOf(wanted);
+    const distance = rowCounts => {
+        let moved = Math.abs(rowCounts.length - wanted.length);
+        laneOf(rowCounts).forEach((lane, i) => {
+            if (lane !== wantedLane[i])
+                moved++;
+        });
+        return moved;
     };
 
-    let best = build(preferred);
-    if (!mins || !mins.some(Boolean))
-        return best;
-    let bestScore = structureViolation(monitor, best, mins);
-    if (bestScore === 0)
-        return best;
-    for (let lanes = 1; lanes <= count; lanes++) {
-        if (lanes === preferred)
-            continue;
-        const candidate = build(lanes);
-        const score = structureViolation(monitor, candidate, mins);
-        const closer = Math.abs(lanes - preferred) < Math.abs(best.columns - preferred);
-        if (score < bestScore - 1 || (Math.abs(score - bestScore) <= 1 && closer)) {
-            best = candidate;
-            bestScore = score;
+    // Every ordered way to cut `count` windows into lanes is 2^(count-1) splits:
+    // fine up to about ten windows. Beyond that, only the even splits.
+    const candidates = [];
+    if (count <= 10) {
+        const walk = (left, current) => {
+            if (left === 0) {
+                candidates.push(current.slice());
+                return;
+            }
+            for (let n = 1; n <= left; n++) {
+                current.push(n);
+                walk(left - n, current);
+                current.pop();
+            }
+        };
+        walk(count, []);
+    } else {
+        for (let lanes = 1; lanes <= count; lanes++) {
+            const perLane = Math.floor(count / lanes);
+            const extra = count - perLane * lanes;
+            candidates.push(Array.from({length: lanes}, (_, c) => perLane + (c < extra ? 1 : 0)));
         }
     }
-    return best;
+
+    const scored = candidates.map(rowCounts => ({
+        rowCounts,
+        score: structureViolation(monitor, make(rowCounts), mins),
+        moved: distance(rowCounts),
+    }));
+    const bestScore = Math.min(...scored.map(s => s.score));
+    let best = null;
+    for (const s of scored) {
+        if (s.score <= bestScore + 1 && (!best || s.moved < best.moved))
+            best = s;
+    }
+    return make(best.rowCounts);
+}
+
+/**
+ * How the windows are cut into lanes when nothing stands in the way: the number
+ * of windows in each lane, in layout order.
+ *
+ * @param {object} monitor - monitor info from getMonitorInfo()
+ * @param {number} count - number of windows to place
+ * @returns {Array} windows per lane
+ */
+function preferredRowCounts(monitor, count) {
+    let lanes;
+    if (monitor.isPortrait)
+        lanes = count <= 3 ? count : Math.ceil(count / 2);
+    else
+        lanes = Math.min(count, monitor.colCount);
+    lanes = Math.max(1, lanes);
+    const perLane = Math.floor(count / lanes);
+    const extra = count - perLane * lanes;
+    return Array.from({length: lanes}, (_, c) => perLane + (c < extra ? 1 : 0));
 }
 
 /**
