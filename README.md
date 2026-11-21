@@ -37,6 +37,19 @@ Everything upstream WinTile does (`Super`+arrows tiling, grid previews, gaps), p
   fit in a 1080 px screen), so they get a row each while the others still pair up. On a
   landscape screen it can mean stacking instead of two columns. With no such windows nothing
   changes.
+- **Force resize (on by default).** A minimum size is only a hint the application sets on its
+  window, so WinTile can lower it: tiled windows are told they may shrink to about 400 px
+  wide, and the tile size wins. A browser app window (YouTube, YouTube Music) then fits
+  beside another window on a 1080 px portrait screen, and a four-window layout is a real 2x2
+  grid instead of a row each. The application draws itself into the smaller space (browsers
+  switch to their narrow layout, a terminal shows fewer columns). Some windows refuse: a
+  normal Chrome window puts its ~640 px minimum back by itself. WinTile notices after a couple of
+  tries, remembers that window's real minimum and plans around it, so Chrome next to a
+  squeezed browser app window or a terminal works, but two Chrome windows still cannot share a
+  1080 px row. Turn it off with
+  `gsettings set org.gnome.shell.extensions.wintile force-resize false` (original minimums
+  come back at once). Needs `python3` and libX11 (present on any X11 desktop); it does nothing
+  on Wayland.
 - **Drag to arrange.** Drag a tiled window by its title bar onto another tile on the **same
   monitor**. Where on that tile you drop decides what happens, and a soft outline shows it
   first:
@@ -268,6 +281,13 @@ journalctl --user -u focus-opacity.service -f
   fixes it. If it still overlaps, there are probably more windows than fit on that monitor:
   add some to the never-tile list or move them to another monitor. Always-on-top windows
   (such as a pinned terminal) are never tiled and float over the layout on purpose.
+- **A window will not get narrower / two windows still do not share a row.** With force
+  resize on this is a real limit of that application, usually normal Chrome (about 640 px).
+  Turn on debug logging (`gsettings set org.gnome.shell.extensions.wintile debug true`) and
+  look for `will not go below` in `journalctl --user -b | grep WinTile`. Windows you have
+  left lowered stay lowered until the application is restarted; `python3
+  ~/.local/share/gnome-shell/extensions/wintile@nowsci.com/force-size.py restore --all`
+  puts every original minimum back.
 - **A window seems stuck in a slot.** Drag it onto another tile: the middle swaps, an edge puts
   it beside / above / below. To free a
   window completely, drag one of its screen-border edges (it floats), or add it to the
@@ -285,7 +305,9 @@ landscape output is identical to the version before orientation support
 (`tests/fixtures/`), that portrait stacks up to 3 and pairs from 4, that windows with a minimum
 size larger than their tile are re-laid out instead of overlapping, and that every drop zone
 arranges windows where you drop them (and refuses what cannot fit), and that auto-tile
-re-attaches after the extension is disabled and enabled (a screen lock and unlock).
+re-attaches after the extension is disabled and enabled (a screen lock and unlock), and that
+force resize squeezes what accepts it, learns what refuses, retries a lowering that was lost,
+and falls back cleanly when the helper cannot run.
 The install test runs `install.sh` / `uninstall.sh` in a throw-away `HOME` with stand-ins for
 `systemctl` and `gnome-extensions`, so it cannot touch your system.
 

@@ -19,13 +19,21 @@ function makeEnv(settings) {
         calls: [],
         config: {cols: 2, rows: 2, ultrawideOnly: false, nonUltraCols: 2, nonUltraRows: 2, useMaximize: true,
             useMinimize: true, preview: {enabled: true, doubleWidth: true, distance: 75, delay: 500},
-            gap: 0, autoTile: false, autoTileBlacklist: [], debug: false},
+            gap: 0, autoTile: false, autoTileBlacklist: [], forceResize: true, debug: false},
         _log() {},
         // one entry per attached listener, like autoTileSignals in the extension
         autoTileConnect() { env.calls.push('connect'); vm.runInContext('autoTileSignals = [1, 2, 3]', env); },
         autoTileDisconnect() { env.calls.push('disconnect'); vm.runInContext('autoTileSignals = []', env); },
         scheduleRetile() { env.calls.push('relayout'); },
-        gsettings: {get_value: key => ({deep_unpack: () => env.settings[key]})},
+        stopForcingSizes() { env.calls.push('restore-hints'); },
+        gsettings: {
+            // like a real compiled schema: asking for a key it lacks must never happen
+            get_value: key => {
+                if (!(key in env.settings)) throw new Error(`schema has no key '${key}'`);
+                return {deep_unpack: () => env.settings[key]};
+            },
+            settings_schema: {has_key: key => key in env.settings},
+        },
         settings: Object.assign({cols: 2, rows: 2, 'double-width': true, 'ultrawide-only': false, 'non-ultra-cols': 2,
             'non-ultra-rows': 2, 'use-maximize': true, 'use-minimize': true, preview: true, distance: 25, delay: 500,
             gap: 6, debug: false, 'auto-tile': true, 'auto-tile-blacklist': []}, settings || {}),
@@ -80,6 +88,34 @@ console.log('4. turning auto-tile off');
     env.settings['auto-tile'] = true;
     env.updateSettings();
     ok(last(env) === 'connect' && attached(env), 'turning it back on attaches again');
+}
+
+console.log('5. force-resize: switching it off restores the windows\' own minimums, once');
+{
+    const env = makeEnv({'force-resize': true});
+    env.updateSettings();
+    ok(env.config.forceResize === true && !env.calls.includes('restore-hints'), 'on: nothing to restore');
+    env.settings['force-resize'] = false;
+    env.calls.length = 0;
+    env.updateSettings();
+    ok(env.config.forceResize === false && env.calls.filter(c => c === 'restore-hints').length === 1,
+        `off: hints restored once, did: ${env.calls}`);
+    env.calls.length = 0;
+    env.updateSettings();
+    ok(!env.calls.includes('restore-hints'), 'still off: not restored again');
+    env.settings['force-resize'] = true;
+    env.updateSettings();
+    ok(env.config.forceResize === true, 'back on');
+}
+
+console.log('6. an older compiled schema without the force-resize key must not crash the shell');
+{
+    const env = makeEnv();
+    delete env.settings['force-resize'];
+    let threw = null;
+    try { env.updateSettings(); } catch (e) { threw = e; }
+    ok(!threw, `updateSettings threw: ${threw}`);
+    ok(env.config.forceResize === true, 'keeps the default (on)');
 }
 
 console.log(fails ? `\n${fails} FAILURE(S)` : '\nALL CHECKS PASSED');

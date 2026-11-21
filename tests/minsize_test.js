@@ -8,7 +8,7 @@ const vm = require('vm');
 const src = fs.readFileSync(process.argv[2], 'utf8');
 const names = ['splitSpan', 'splitSpanWeighted', 'autoTileStructure', 'preferredRowCounts', 'structureViolation', 'fitWeights', 'minsKeyOf', 'autoTileGap',
     'evenLayoutState', 'autoTileRects', 'isTileCandidate', 'isBlacklisted', 'retileAll', 'autoTileKey', 'reconcileRows', 'rowsFeasible',
-    'scheduleVerify', 'verifyTiles'];
+    'scheduleVerify', 'verifyTiles', 'forcing', 'layoutMin', 'xidOf', 'relaxMinimums', 'stopForcingSizes'];
 let code = '';
 for (const n of names) {
     const m = new RegExp(`^function ${n}\\(`, 'm').exec(src);
@@ -48,7 +48,7 @@ function makeEnv(monitors) {
     env.getActiveWorkspace = () => env.workspace;
     vm.createContext(env);
     vm.runInContext('let windowMoving = false, autoTiling = false, verifyTimer = null; ' +
-        'const layoutState = new Map(); const arrangement = new Map();', env);
+        'const FORCE_MIN = {w: 400, h: 120}; const layoutState = new Map(); const arrangement = new Map();', env);
     vm.runInContext(code, env);
     return env;
 }

@@ -9,7 +9,7 @@ const names = ['splitSpan', 'splitSpanWeighted', 'autoTileStructure', 'preferred
     'fitWeights', 'minsKeyOf', 'autoTileGap', 'evenLayoutState', 'autoTileRects', 'isTileCandidate', 'isBlacklisted',
     'retileAll', 'autoTileKey', 'layoutKey', 'tileCandidates', 'reconcileRows', 'currentRows', 'rowsFeasible',
     'dropZone', 'zoneRect', 'proposeDrop', 'applyRows', 'findSwapTarget', 'swapDragMoved', 'stopSwapDrag',
-    'updateSwapHighlight', 'beginSwapDrag', 'endSwapDrag', 'scheduleVerify', 'verifyTiles'];
+    'updateSwapHighlight', 'beginSwapDrag', 'endSwapDrag', 'scheduleVerify', 'verifyTiles', 'forcing', 'layoutMin', 'xidOf', 'relaxMinimums', 'stopForcingSizes'];
 let code = '';
 for (const n of names) {
     const m = new RegExp(`^function ${n}\\(`, 'm').exec(src);
@@ -56,7 +56,7 @@ function makeEnv(monitors) {
     env.getActiveWorkspace = () => env.workspace;
     vm.createContext(env);
     vm.runInContext('let windowMoving = false, autoTiling = false, swapDrag = null, swapDragTimer = null, ' +
-        'swapHighlight = null, verifyTimer = null; const layoutState = new Map(); const arrangement = new Map(); ' +
+        'swapHighlight = null, verifyTimer = null; const FORCE_MIN = {w: 400, h: 120}; const layoutState = new Map(); const arrangement = new Map(); ' +
         "const SWAP_STYLE_OK = 'ok', SWAP_STYLE_NO = 'no';", env);
     vm.runInContext(code, env);
     return env;

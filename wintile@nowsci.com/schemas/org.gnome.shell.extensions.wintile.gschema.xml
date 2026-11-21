@@ -78,6 +78,11 @@
       <summary>Windows auto-tiling must never touch</summary>
       <description>WM_CLASS names or title fragments, matched case-insensitively. Defaults cover browser picture-in-picture players, which float on purpose.</description>
     </key>
+    <key name="force-resize" type="b">
+      <default>true</default>
+      <summary>Squeeze windows below their own minimum size when tiling</summary>
+      <description>Applications declare a minimum size (a browser about 640 px wide) that the window manager enforces, so wide windows cannot share a narrow or portrait monitor. When on, auto-tiling lowers that minimum so every window takes the tile it is given; the application redraws itself smaller. Turn it off to keep each application's own minimum.</description>
+    </key>
     <key name="debug" type="b">
       <default>false</default>
       <summary>Turn on/off debug output</summary>

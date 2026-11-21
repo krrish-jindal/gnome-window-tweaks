@@ -31,6 +31,7 @@ echo "1. full install into an empty HOME"
 fresh_home
 "$ROOT/install.sh" --skip-deps >/dev/null
 check "extension.js installed"            test -f "$HOME/.local/share/gnome-shell/extensions/wintile@nowsci.com/extension.js"
+check "force-size.py installed"            test -f "$HOME/.local/share/gnome-shell/extensions/wintile@nowsci.com/force-size.py"
 check "schema compiled"                   test -f "$HOME/.local/share/gnome-shell/extensions/wintile@nowsci.com/schemas/gschemas.compiled"
 check "install marker written"            test -f "$HOME/.local/share/gnome-shell/extensions/wintile@nowsci.com/.installed-by-gnome-window-tweaks"
 check "auto-tile key is in the schema"    bash -c "gsettings --schemadir '$HOME/.local/share/gnome-shell/extensions/wintile@nowsci.com/schemas' list-keys org.gnome.shell.extensions.wintile | grep -qx auto-tile"

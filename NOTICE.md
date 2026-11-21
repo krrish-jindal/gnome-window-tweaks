@@ -85,3 +85,23 @@ Modified `extension.js`:
 - Diagnostic `_log` lines (only with the `debug` setting on) at each early exit of the drag
   handler.
 
+### 2026-11-21 (evening) — force resize
+
+Added `wintile@nowsci.com/force-size.py` and modified `extension.js`, the schema and the tests:
+
+- New setting `force-resize` (default on). Applications declare a minimum size in the
+  `WM_NORMAL_HINTS` property of their window and mutter enforces it. `force-size.py` (Python,
+  ctypes on libX11) lowers that minimum, never raises it, and remembers the original in
+  `$XDG_RUNTIME_DIR/wintile-size-hints.json` so `restore` can put it back. The extension lowers
+  every tiled X11 window to about 400 x 120 (plus the window's shadow) once, asynchronously,
+  and relays out when the helper is done; layout plans with the lowered minimum straight away.
+- `verifyTiles()` no longer writes a window off at its first miss: a window still bigger than its
+  tile is lowered again (up to three times, verification waits 400 ms instead of 160) and only
+  then, if it keeps refusing (normal Chrome windows do: they resize themselves back and rewrite
+  their own hint), is its real size learned as its minimum, as before.
+- Switching the setting off restores every original minimum. Disabling the extension (a screen
+  lock) deliberately does not, which would make windows jump on every unlock.
+- `updateSettings()` asks the schema whether `force-resize` exists before reading it: a compiled
+  schema without a key aborts the whole shell when asked for it.
+- Tests: `tests/force_test.js` (new); the existing harnesses register the new functions.
+

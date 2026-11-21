@@ -46,6 +46,7 @@ let config = {
     gap: 0,
     autoTile: false,
     autoTileBlacklist: [],
+    forceResize: true,
     debug: true,
 };
 
@@ -69,6 +70,12 @@ function updateSettings() {
 
     config.autoTile = gsettings.get_value('auto-tile').deep_unpack();
     config.autoTileBlacklist = gsettings.get_value('auto-tile-blacklist').deep_unpack();
+    // Guarded: asking a compiled schema for a key it lacks aborts the whole shell.
+    const hadForce = config.forceResize;
+    if (gsettings.settings_schema.has_key('force-resize'))
+        config.forceResize = gsettings.get_value('force-resize').deep_unpack();
+    if (hadForce && !config.forceResize)
+        stopForcingSizes();
     _log(JSON.stringify(config));
 
     // Decide from whether the listeners are really attached, not from whether the
@@ -1678,7 +1685,8 @@ function retileAll() {
             // Floating windows are counted in the structure even though they are
             // not placed, so their slot stays reserved and the windows around
             // them never shuffle just because one left the layout.
-            const mins = candidates.map(a => a.wintileMin);
+            relaxMinimums(candidates);
+            const mins = candidates.map(layoutMin);
             const structure = arranged
                 ? {columns: arranged.length, rowCounts: arranged.map(r => r.length), portrait: !!monitor.isPortrait}
                 : autoTileStructure(monitor, candidates.length, mins);
@@ -1756,7 +1764,7 @@ let verifyTimer = null;
  *
  * @param {number} delay - milliseconds to wait
  */
-function scheduleVerify(delay = 160) {
+function scheduleVerify(delay = 400) {
     if (verifyTimer) {
         GLib.source_remove(verifyTimer);
         verifyTimer = null;
@@ -1784,6 +1792,7 @@ function verifyTiles() {
     }
 
     let learned = false;
+    const again = [];
     for (const app of getActiveWorkspace().list_windows()) {
         const target = app.wintileTarget;
         if (!target || app.wintileFloat || app.minimized || app.is_fullscreen() || app.is_above() ||
@@ -1792,8 +1801,27 @@ function verifyTiles() {
         const f = app.get_frame_rect();
         const overW = f.width > target.w + 1;
         const overH = f.height > target.h + 1;
-        if (!overW && !overH)
+        if (!overW && !overH) {
+            app.wintileForceTries = 0;
             continue;
+        }
+
+        if (forcing(app)) {
+            // Still too big although its minimum was lowered: the hint has not
+            // landed yet, or the application put its own minimum back. Lower it
+            // again; only a window that keeps refusing has a real minimum.
+            if (app.wintileRelaxed === 'pending')
+                continue;
+            app.wintileForceTries = (app.wintileForceTries || 0) + 1;
+            if (app.wintileForceTries <= 3) {
+                _log(`verifyTiles) ${app.get_wm_class()} is ${f.width}x${f.height} in a ${target.w}x${target.h} tile; lowering its minimum again`);
+                delete app.wintileRelaxed;
+                again.push(app);
+                continue;
+            }
+            _log(`verifyTiles) ${app.get_wm_class()} will not go below ${f.width}x${f.height} even when forced (tile ${target.w}x${target.h}, hint lowered ${app.wintileForceTries - 1} times)`);
+            app.wintileRelaxed = 'refused';
+        }
 
         const monitor = getMonitorInfo(app.get_monitor());
         const prev = app.wintileMin || {w: 0, h: 0};
@@ -1810,8 +1838,146 @@ function verifyTiles() {
             learned = true;
         }
     }
+    if (again.length)
+        relaxMinimums(again);
     if (learned)
         scheduleRetile(0);
+}
+
+// --- Forcing a smaller size -------------------------------------------------
+// Applications declare a minimum size (a browser: ~640 px wide) and the window
+// manager honours it, so two browsers can never share a 1080 px portrait monitor.
+// That minimum is only a hint -- the WM_NORMAL_HINTS property of the window -- so
+// with `force-resize` on, tiled windows get a much lower one (the floor below) and
+// the tile size wins. The application then draws itself into whatever it is given:
+// browsers switch to their narrow layout, a terminal just shows fewer columns.
+// Done by force-size.py because the shell has no call for it; the original hints
+// are remembered there so they can be put back.
+const FORCE_MIN = {w: 400, h: 120};   // smallest visible size forced windows may get
+// per window `wintileRelaxed`: 'pending' (helper running), 'done', or one of
+// 'unavailable' / 'failed' / 'refused' (leave this window to its own minimum)
+
+/**
+ * Whether a window's minimum is being lowered by us.
+ *
+ * @param {object} app - the window object
+ * @returns {boolean} true when force-resize is on and has not given up on this window
+ */
+function forcing(app) {
+    return config.forceResize &&
+        app.wintileRelaxed !== 'unavailable' &&
+        app.wintileRelaxed !== 'failed' &&
+        app.wintileRelaxed !== 'refused';
+}
+
+/**
+ * The minimum size layout should plan around for a window.
+ *
+ * @param {object} app - the window object
+ * @returns {object|undefined} { w, h }, or undefined when nothing is known
+ */
+function layoutMin(app) {
+    const learned = app.wintileMin;
+    if (!forcing(app))
+        return learned;
+    // Assumed lowered even while the helper is still running, so the first layout
+    // is already the final one.
+    return {
+        w: Math.min(learned ? learned.w : FORCE_MIN.w, FORCE_MIN.w),
+        h: Math.min(learned ? learned.h : FORCE_MIN.h, FORCE_MIN.h),
+    };
+}
+
+/**
+ * The X11 window id of a window, as hex text.
+ *
+ * @param {object} app - the window object
+ * @returns {string|null} for example "0x4600021", or null when it has none
+ */
+function xidOf(app) {
+    try {
+        if (app.get_client_type() !== Meta.WindowClientType.X11)
+            return null;
+        const m = /^0x[0-9a-f]+/i.exec(app.get_description());
+        return m ? m[0] : null;
+    } catch (e) {
+        return null;
+    }
+}
+
+/**
+ * Lower the minimum size of windows that have not had it lowered yet.
+ * Asynchronous: when the helper is done the layout is redone.
+ *
+ * @param {Array} apps - window objects
+ */
+function relaxMinimums(apps) {
+    if (!config.forceResize)
+        return;
+    const jobs = [];
+    for (const app of apps) {
+        if (app.wintileRelaxed !== undefined)
+            continue;
+        const xid = xidOf(app);
+        if (!xid) {
+            app.wintileRelaxed = 'unavailable';
+            continue;
+        }
+        // The hint is for the whole client window, shadow included.
+        const frame = app.get_frame_rect();
+        const buffer = app.get_buffer_rect();
+        jobs.push({
+            app, xid,
+            w: FORCE_MIN.w + Math.max(0, buffer.width - frame.width),
+            h: FORCE_MIN.h + Math.max(0, buffer.height - frame.height),
+        });
+        app.wintileRelaxed = 'pending';
+    }
+    if (!jobs.length)
+        return;
+    const argv = ['python3', GLib.build_filenamev([wintile.extdatadir, 'force-size.py']), 'set'];
+    for (const j of jobs)
+        argv.push(j.xid, `${j.w}`, `${j.h}`);
+    _log(`relaxMinimums) ${argv.slice(3).join(' ')}`);
+    const finish = ok => {
+        for (const j of jobs) {
+            if (j.app.wintileRelaxed === 'pending')
+                j.app.wintileRelaxed = ok ? 'done' : 'failed';
+        }
+        scheduleRetile(0);
+    };
+    try {
+        const proc = Gio.Subprocess.new(argv, Gio.SubprocessFlags.STDOUT_SILENCE | Gio.SubprocessFlags.STDERR_SILENCE);
+        proc.wait_async(null, (p, res) => {
+            let ok = false;
+            try {
+                p.wait_finish(res);
+                ok = p.get_successful();
+            } catch (e) {
+                _log(`relaxMinimums) ${e}`);
+            }
+            finish(ok);
+        });
+    } catch (e) {
+        _log(`relaxMinimums) cannot run force-size.py: ${e}`);
+        finish(false);
+    }
+}
+
+/**
+ * Force-resize was switched off: give every window its own minimum back.
+ */
+function stopForcingSizes() {
+    try {
+        Gio.Subprocess.new(['python3', GLib.build_filenamev([wintile.extdatadir, 'force-size.py']), 'restore', '--all'],
+            Gio.SubprocessFlags.STDOUT_SILENCE | Gio.SubprocessFlags.STDERR_SILENCE);
+    } catch (e) {
+        _log(`stopForcingSizes) ${e}`);
+    }
+    for (const app of global.get_window_actors().map(a => a.meta_window)) {
+        delete app.wintileRelaxed;
+        delete app.wintileForceTries;
+    }
 }
 
 // --- Drag to swap -----------------------------------------------------------
@@ -1921,7 +2087,7 @@ function currentRows(monitorIndex, candidates) {
     if (state && state.rowCounts && state.rowCounts.reduce((x, y) => x + y, 0) === candidates.length)
         rowCounts = state.rowCounts;
     if (!rowCounts)
-        rowCounts = autoTileStructure(monitor, candidates.length, candidates.map(w => w.wintileMin)).rowCounts;
+        rowCounts = autoTileStructure(monitor, candidates.length, candidates.map(layoutMin)).rowCounts;
     const rows = [];
     let i = 0;
     for (const n of rowCounts) {
@@ -1944,7 +2110,7 @@ function rowsFeasible(monitor, rows) {
         rowCounts: rows.map(r => r.length),
         portrait: !!monitor.isPortrait,
     };
-    return structureViolation(monitor, structure, rows.flat().map(w => w.wintileMin)) === 0;
+    return structureViolation(monitor, structure, rows.flat().map(layoutMin)) === 0;
 }
 
 /**

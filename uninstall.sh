@@ -37,6 +37,10 @@ echo "  removed"
 
 echo "== WinTile (fork) =="
 if [ -f "$EXT_DIR/$MARK" ]; then
+    # Windows WinTile squeezed below their own minimum size get that minimum back.
+    if [ "$ENABLE" -eq 1 ] && [ -f "$EXT_DIR/force-size.py" ] && command -v python3 >/dev/null 2>&1; then
+        python3 "$EXT_DIR/force-size.py" restore --all 2>/dev/null || true
+    fi
     if [ "$ENABLE" -eq 1 ] && command -v gnome-extensions >/dev/null 2>&1; then
         gnome-extensions disable "$UUID" 2>/dev/null || true
     fi

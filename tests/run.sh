@@ -7,7 +7,7 @@ command -v node >/dev/null 2>&1 || { echo "node is required to run the tests"; e
 
 echo "== syntax =="
 node --check wintile@nowsci.com/extension.js && echo "  extension.js parses"
-for f in focus-opacity/bin/* tools/wintile-never-tile; do
+for f in focus-opacity/bin/* tools/wintile-never-tile wintile@nowsci.com/force-size.py; do
     python3 -I -c "import ast,sys; ast.parse(open(sys.argv[1]).read())" "$f" && echo "  $f parses"
 done
 for f in install.sh uninstall.sh tests/install_test.sh tests/run.sh; do
@@ -22,6 +22,9 @@ node tests/minsize_test.js wintile@nowsci.com/extension.js
 
 echo; echo "== WinTile: survives disable/enable (screen lock) =="
 node tests/lifecycle_test.js wintile@nowsci.com/extension.js
+
+echo; echo "== WinTile: force resize (squeeze below application minimums) =="
+node tests/force_test.js wintile@nowsci.com/extension.js
 
 echo; echo "== WinTile: drag to arrange =="
 node tests/arrange_test.js wintile@nowsci.com/extension.js
