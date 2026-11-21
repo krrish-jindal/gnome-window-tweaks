@@ -48,3 +48,14 @@ Modified `extension.js`:
   exchanges their places (a highlight outlines the target while dragging). Dropped
   anywhere else, the window returns to its own slot.
 
+### 2026-11-21 — portrait stacks fully; minimum window sizes respected
+
+Modified `extension.js`:
+
+- **Portrait monitors now stack every window** in its own full-width row. The previous
+  portrait layout put two windows side by side for three or more windows, which is too
+  narrow for most applications.
+- **Minimum sizes.** After a layout the extension compares each window's real size with its
+  tile; a window that is still larger has hit its application's minimum size. That minimum
+  is remembered and the next layout picks the column/row count in which the windows fit,
+  instead of letting them overlap.

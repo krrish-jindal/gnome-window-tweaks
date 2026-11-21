@@ -6,7 +6,8 @@ const vm = require('vm');
 const src = fs.readFileSync(process.argv[2], 'utf8');
 const names = ['splitSpan', 'splitSpanWeighted', 'autoTileStructure', 'autoTileGap', 'evenLayoutState',
     'autoTileRects', 'isTileCandidate', 'isBlacklisted', 'retileAll', 'autoTileKey', 'swapAutoTileOrder',
-    'findSwapTarget', 'swapDragMoved', 'stopSwapDrag', 'updateSwapHighlight', 'beginSwapDrag', 'endSwapDrag'];
+    'findSwapTarget', 'swapDragMoved', 'stopSwapDrag', 'updateSwapHighlight', 'beginSwapDrag', 'endSwapDrag',
+    'structureViolation', 'scheduleVerify', 'verifyTiles'];
 let code = '';
 for (const n of names) {
     const m = new RegExp(`^function ${n}\\(`, 'm').exec(src);
@@ -47,7 +48,7 @@ function makeEnv(monitors) {
     env.getActiveWorkspace = () => env.workspace;
     vm.createContext(env);
     vm.runInContext('let windowMoving = false, autoTiling = false, swapDrag = null, swapDragTimer = null, ' +
-        'swapHighlight = null; const layoutState = new Map();', env);
+        'swapHighlight = null, verifyTimer = null; const layoutState = new Map();', env);
     vm.runInContext(code, env);
     return env;
 }

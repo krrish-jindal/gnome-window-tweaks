@@ -17,6 +17,9 @@ done
 echo; echo "== WinTile: orientation layout (landscape output must equal the pre-orientation version) =="
 node tests/orientation_test.js tests/fixtures/extension.pre-orientation.js wintile@nowsci.com/extension.js
 
+echo; echo "== WinTile: minimum window sizes (no overlap) =="
+node tests/minsize_test.js wintile@nowsci.com/extension.js
+
 echo; echo "== WinTile: drag-to-swap =="
 node tests/swap_test.js wintile@nowsci.com/extension.js
 

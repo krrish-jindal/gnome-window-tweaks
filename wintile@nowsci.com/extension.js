@@ -1274,22 +1274,84 @@ function isBlacklisted(app) {
  * transposed on portrait. The names are kept so the weight bookkeeping and the
  * hand-resize code stay a single code path for both orientations.
  *
+ * Landscape caps the lanes at the grid's column count. Portrait gives every
+ * window its own full-width row: a portrait screen is too narrow to put windows
+ * beside each other, and most applications refuse to be that narrow.
+ *
+ * Windows with a known minimum size (learned by verifyTiles()) can veto that
+ * preference. Every lane count is scored by how far the windows' even tiles
+ * would fall short of their minimums, and the preferred count is only replaced
+ * by one that is clearly better, or equally good and closer to it. With no known
+ * minimums this is simply the preferred layout.
+ *
  * @param {object} monitor - monitor info from getMonitorInfo()
  * @param {number} count - number of windows to place
+ * @param {Array} [mins] - per window, in layout order: { w, h } minimum frame size or undefined
  * @returns {object} { columns, rowCounts, portrait }
  */
-function autoTileStructure(monitor, count) {
+function autoTileStructure(monitor, count, mins) {
     const portrait = !!monitor.isPortrait;
-    // getMonitorInfo() has already swapped the grid for a portrait screen, so the
-    // lane cap on the long axis is rowCount there and colCount otherwise.
-    const cap = portrait ? monitor.rowCount : monitor.colCount;
-    const columns = Math.max(1, Math.min(count, cap));
-    const perCol = Math.floor(count / columns);
-    const extra = count - perCol * columns;
-    const rowCounts = [];
-    for (let c = 0; c < columns; c++)
-        rowCounts.push(perCol + (c < extra ? 1 : 0));
-    return {columns, rowCounts, portrait};
+    const preferred = Math.max(1, portrait ? count : Math.min(count, monitor.colCount));
+    const build = lanes => {
+        const perCol = Math.floor(count / lanes);
+        const extra = count - perCol * lanes;
+        const rowCounts = [];
+        for (let c = 0; c < lanes; c++)
+            rowCounts.push(perCol + (c < extra ? 1 : 0));
+        return {columns: lanes, rowCounts, portrait};
+    };
+
+    let best = build(preferred);
+    if (!mins || !mins.some(Boolean))
+        return best;
+    let bestScore = structureViolation(monitor, best, mins);
+    if (bestScore === 0)
+        return best;
+    for (let lanes = 1; lanes <= count; lanes++) {
+        if (lanes === preferred)
+            continue;
+        const candidate = build(lanes);
+        const score = structureViolation(monitor, candidate, mins);
+        const closer = Math.abs(lanes - preferred) < Math.abs(best.columns - preferred);
+        if (score < bestScore - 1 || (Math.abs(score - bestScore) <= 1 && closer)) {
+            best = candidate;
+            bestScore = score;
+        }
+    }
+    return best;
+}
+
+/**
+ * How many pixels, summed over all windows, an even split of `structure` leaves
+ * them short of their known minimum sizes. Zero means everything fits.
+ *
+ * @param {object} monitor - monitor info from getMonitorInfo()
+ * @param {object} structure - from autoTileStructure()
+ * @param {Array} mins - per window, in layout order: { w, h } or undefined
+ * @returns {number} total shortfall in px
+ */
+function structureViolation(monitor, structure, mins) {
+    const gap = config.gap;
+    const lanes = structure.columns;
+    // Lanes run along x on landscape and along y on portrait.
+    const laneSpan = structure.portrait ? monitor.height : monitor.width;
+    const itemSpan = structure.portrait ? monitor.width : monitor.height;
+    const laneLen = (laneSpan - gap * (lanes + 1)) / lanes;
+    let total = 0;
+    let i = 0;
+    for (let c = 0; c < lanes; c++) {
+        const n = structure.rowCounts[c];
+        const itemLen = (itemSpan - gap * (n + 1)) / n;
+        for (let r = 0; r < n; r++, i++) {
+            const m = mins[i];
+            if (!m)
+                continue;
+            const w = structure.portrait ? itemLen : laneLen;
+            const h = structure.portrait ? laneLen : itemLen;
+            total += Math.max(0, m.w - w) + Math.max(0, m.h - h);
+        }
+    }
+    return total;
 }
 
 /**
@@ -1417,7 +1479,8 @@ function retileAll() {
             // Floating windows are counted in the structure even though they are
             // not placed, so their slot stays reserved and the windows around
             // them never shuffle just because one left the layout.
-            const structure = autoTileStructure(monitor, candidates.length);
+            const structure = autoTileStructure(monitor, candidates.length,
+                candidates.map(a => a.wintileMin));
             // Weights only describe the structure they were built for.
             // That includes the orientation: rotating a monitor turns left/right
             // into up/down, so weights from the old arrangement must not carry over.
@@ -1434,6 +1497,7 @@ function retileAll() {
                 if (app.wintileFloat) {
                     // Owns no shared edges while it sits outside the layout.
                     delete app.wintileSlot;
+                    delete app.wintileTarget;
                     return;
                 }
                 const rect = rects[i];
@@ -1442,6 +1506,8 @@ function retileAll() {
                 // Remembered so a later hand resize knows which edges this
                 // window shares with a neighbour.
                 app.wintileSlot = {key, col: rect.col, row: rect.row};
+                // What verifyTiles() later compares the real size against.
+                app.wintileTarget = {w: rect.w, h: rect.h};
                 // Drop stale manual-tiling state so Super+Arrow re-reads the
                 // window's real position the next time it is used.
                 delete app.wintile;
@@ -1450,6 +1516,7 @@ function retileAll() {
     } finally {
         autoTiling = false;
     }
+    scheduleVerify();
 }
 
 /**
@@ -1469,6 +1536,78 @@ function scheduleRetile(delay = 120) {
         retileAll();
         return GLib.SOURCE_REMOVE;
     });
+}
+
+// --- Minimum sizes ----------------------------------------------------------
+// A window cannot be made smaller than the minimum its application sets, so a
+// tile below that makes it spill over its neighbours. The minimum is not
+// readable from here, but it shows: mutter clamps the frame to it, so a window
+// that is still bigger than the tile it was given has hit its minimum. That size
+// is remembered (it only ever grows) and the next layout picks a lane count in
+// which everything fits.
+let verifyTimer = null;
+
+/**
+ * Check the placed windows shortly after a layout, once they have settled.
+ *
+ * @param {number} delay - milliseconds to wait
+ */
+function scheduleVerify(delay = 160) {
+    if (verifyTimer) {
+        GLib.source_remove(verifyTimer);
+        verifyTimer = null;
+    }
+    verifyTimer = GLib.timeout_add(GLib.PRIORITY_DEFAULT, delay, () => {
+        verifyTimer = null;
+        verifyTiles();
+        return GLib.SOURCE_REMOVE;
+    });
+}
+
+/**
+ * Learn minimum sizes from windows that did not fit the tile they were given,
+ * and relayout when one is found.
+ */
+function verifyTiles() {
+    if (!config.autoTile || windowMoving || autoTiling)
+        return;
+    // Mid-drag a window is legitimately bigger or smaller than its tile.
+    try {
+        if (global.display.get_grab_op() !== Meta.GrabOp.NONE)
+            return;
+    } catch (e) {
+        // No grab query on this shell: carry on.
+    }
+
+    let learned = false;
+    for (const app of getActiveWorkspace().list_windows()) {
+        const target = app.wintileTarget;
+        if (!target || app.wintileFloat || app.minimized || app.is_fullscreen() || app.is_above() ||
+            app.maximized_horizontally || app.maximized_vertically)
+            continue;
+        const f = app.get_frame_rect();
+        const overW = f.width > target.w + 1;
+        const overH = f.height > target.h + 1;
+        if (!overW && !overH)
+            continue;
+
+        const monitor = getMonitorInfo(app.get_monitor());
+        const prev = app.wintileMin || {w: 0, h: 0};
+        const next = {
+            w: overW ? Math.max(prev.w, f.width) : prev.w,
+            h: overH ? Math.max(prev.h, f.height) : prev.h,
+        };
+        // Bigger than the whole monitor is not a minimum size, it is something else.
+        if (next.w > monitor.width || next.h > monitor.height)
+            continue;
+        if (next.w - prev.w > 1 || next.h - prev.h > 1) {
+            _log(`verifyTiles) ${app.get_wm_class()} cannot go below ${next.w}x${next.h}`);
+            app.wintileMin = next;
+            learned = true;
+        }
+    }
+    if (learned)
+        scheduleRetile(0);
 }
 
 // --- Drag to swap -----------------------------------------------------------
@@ -1864,6 +2003,10 @@ function autoTileDisconnect() {
         obj.disconnect(id);
     autoTileSignals = [];
     stopSwapDrag();
+    if (verifyTimer) {
+        GLib.source_remove(verifyTimer);
+        verifyTimer = null;
+    }
     layoutState.clear();
     if (autoTileTimer) {
         GLib.source_remove(autoTileTimer);

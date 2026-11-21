@@ -24,9 +24,15 @@ Everything upstream WinTile does (`Super`+arrows tiling, grid previews, gaps), p
   **`Super`+`Shift`+`T`** (or the `auto-tile` setting).
 - **Follows monitor orientation.**
   - *Landscape:* windows go **side by side** (left/right).
-  - *Portrait:* windows go **stacked** (top/bottom). With 3+ windows the extras sit side by
-    side inside a row, the mirror image of landscape.
+  - *Portrait:* windows go **stacked** (top/bottom), each one full width. A portrait screen is
+    too narrow to put windows beside each other, and most apps refuse to be that narrow.
   - Rotating a monitor re-lays it out straight away.
+- **Respects minimum window sizes.** Many apps cannot be made smaller than a minimum (a
+  Chromium-based browser is about 580 px wide), and a tile smaller than that makes the window
+  spill over its neighbour. After each layout WinTile checks whether any window is still bigger
+  than its tile; if so it remembers that window's minimum and re-lays out with a column or row
+  count in which everything fits (for example, stacking instead of two columns). With no such
+  windows nothing changes.
 - **Drag to swap.** Drag a tiled window by its title bar onto another tile on the **same
   monitor** and drop it: the two trade places. A soft blue outline shows the tile you would
   swap with. Dropped anywhere else (empty desktop, another monitor, over a dialog) the
@@ -235,6 +241,11 @@ journalctl --user -u focus-opacity.service -f
   `focus-opacity --status`.
 - **Wallpaper is not blurring.** See *Wallpaper source* above, then run
   `focus-opacity --reblur`.
+- **Two windows overlap.** Usually one of them has a minimum size larger than its tile. The
+  first layout may overlap for a fraction of a second; WinTile then learns the minimum and
+  fixes it. If it still overlaps, there are probably more windows than fit on that monitor:
+  add some to the never-tile list or move them to another monitor. Always-on-top windows
+  (such as a pinned terminal) are never tiled and float over the layout on purpose.
 - **A window seems stuck in a slot.** Dragging it onto another tile now swaps them. To free a
   window completely, drag one of its screen-border edges (it floats), or add it to the
   never-tile list.
@@ -248,7 +259,9 @@ journalctl --user -u focus-opacity.service -f
 The WinTile tests run the **real** layout, resize and drag-swap functions from
 `extension.js` against fake windows and a fake pointer. They check, among other things, that
 landscape output is identical to the version before orientation support
-(`tests/fixtures/`), that portrait stacks correctly, and that swaps keep hand-resized sizes.
+(`tests/fixtures/`), that portrait is always a full-width stack, that windows with a minimum
+size larger than their tile are re-laid out instead of overlapping, and that swaps keep
+hand-resized sizes.
 The install test runs `install.sh` / `uninstall.sh` in a throw-away `HOME` with stand-ins for
 `systemctl` and `gnome-extensions`, so it cannot touch your system.
 
