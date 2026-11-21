@@ -72,3 +72,16 @@ Modified `extension.js`:
   automatic layout while the orientation holds and every window's minimum size still fits; new
   windows get a lane of their own, closed ones drop out.
 - A drop that cannot fit is refused: the outline turns red and a notification says why.
+
+### 2026-11-21 (later still) — auto-tile survives disable/enable
+
+Modified `extension.js`:
+
+- `updateSettings()` now decides whether to attach auto-tile's window and drag listeners from
+  whether they are actually attached, not from whether the setting changed. GNOME disables and
+  re-enables the extension on every screen lock and unlock while the module (and its remembered
+  `config.autoTile`) survives; the old comparison saw "no change" and left auto-tiling silently
+  dead until the shell was restarted.
+- Diagnostic `_log` lines (only with the `debug` setting on) at each early exit of the drag
+  handler.
+

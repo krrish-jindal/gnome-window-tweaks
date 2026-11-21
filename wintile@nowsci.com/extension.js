@@ -67,20 +67,24 @@ function updateSettings() {
     config.gap = gsettings.get_value('gap').deep_unpack();
     config.debug = gsettings.get_value('debug').deep_unpack();
 
-    const wasAutoTile = config.autoTile;
     config.autoTile = gsettings.get_value('auto-tile').deep_unpack();
     config.autoTileBlacklist = gsettings.get_value('auto-tile-blacklist').deep_unpack();
     _log(JSON.stringify(config));
 
-    if (config.autoTile !== wasAutoTile) {
-        if (config.autoTile)
-            autoTileConnect();
-        else
-            autoTileDisconnect();
-    } else if (config.autoTile) {
+    // Decide from whether the listeners are really attached, not from whether the
+    // setting changed: disable() detaches them, but this module (and so the old
+    // `config.autoTile`) survives a disable/enable. GNOME does exactly that on
+    // every screen lock and unlock, and comparing with the remembered value would
+    // then see "no change" and leave auto-tiling dead.
+    const connected = autoTileSignals.length > 0;
+    _log(`updateSettings) autoTile=${config.autoTile} listenersAttached=${connected}`);
+    if (config.autoTile && !connected)
+        autoTileConnect();
+    else if (!config.autoTile && connected)
+        autoTileDisconnect();
+    else if (config.autoTile)
         // cols/rows/gap changed while auto-tiling: relayout with the new grid
         scheduleRetile();
-    }
 }
 
 const wintile = {
@@ -2133,6 +2137,11 @@ function updateSwapHighlight() {
                 plan = proposeDrop(drag.app, target, zone, drag.monitor);
             }
         }
+        const hint = target && plan ? `${target.get_wm_class()}:${zone}:${plan.fits}` : 'none';
+        if (hint !== drag.lastHint) {
+            drag.lastHint = hint;
+            _log(`updateSwapHighlight) outline -> ${hint}`);
+        }
         if (swapHighlight) {
             if (target && plan) {
                 const r = zoneRect(target.get_frame_rect(), zone);
@@ -2163,8 +2172,11 @@ function updateSwapHighlight() {
  */
 function beginSwapDrag(app) {
     stopSwapDrag();
-    if (app.wintileFloat || !isTileCandidate(app))
+    if (app.wintileFloat || !isTileCandidate(app)) {
+        _log(`beginSwapDrag) ${app.get_wm_class()} is not tracked (floating: ${!!app.wintileFloat})`);
         return;
+    }
+    _log(`beginSwapDrag) tracking ${app.get_wm_class()} on monitor ${app.get_monitor()}`);
     const frame = app.get_frame_rect();
     swapDrag = {
         app,
@@ -2197,17 +2209,37 @@ function beginSwapDrag(app) {
 function endSwapDrag(app) {
     const drag = swapDrag;
     stopSwapDrag();
-    if (!drag || drag.app !== app || !swapDragMoved(drag, app))
+    if (!drag) {
+        _log(`endSwapDrag) ${app.get_wm_class()}: no drag was being tracked (floating, or not a tile)`);
         return false;
-    if (app.get_monitor() !== drag.monitor)
+    }
+    if (drag.app !== app) {
+        _log('endSwapDrag) the grab ended on a different window than the one tracked');
         return false;
+    }
+    if (!swapDragMoved(drag, app)) {
+        _log(`endSwapDrag) ${app.get_wm_class()} did not move: a click, not a drag`);
+        return false;
+    }
+    if (app.get_monitor() !== drag.monitor) {
+        _log(`endSwapDrag) ${app.get_wm_class()} was dropped on another monitor`);
+        return false;
+    }
     const target = findSwapTarget(app, drag.monitor);
-    if (!target)
+    if (!target) {
+        _log(`endSwapDrag) no tile under the pointer at ${JSON.stringify(global.get_pointer().slice(0, 2))}`);
         return false;
+    }
     const zone = dropZone(target);
     const plan = proposeDrop(app, target, zone, drag.monitor);
-    if (!plan || plan.same)
+    if (!plan) {
+        _log('endSwapDrag) one of the two windows is not tiled on this monitor');
         return false;
+    }
+    if (plan.same) {
+        _log(`endSwapDrag) ${zone} of ${target.get_wm_class()}: already arranged like that`);
+        return false;
+    }
     if (!plan.fits) {
         _log(`endSwapDrag) ${zone} drop of ${app.get_wm_class()} on ${target.get_wm_class()} does not fit`);
         Main.notify('WinTile', 'That arrangement will not fit: one of those windows cannot be made small enough.');

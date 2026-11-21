@@ -20,6 +20,9 @@ node tests/orientation_test.js tests/fixtures/extension.pre-orientation.js winti
 echo; echo "== WinTile: minimum window sizes (no overlap) =="
 node tests/minsize_test.js wintile@nowsci.com/extension.js
 
+echo; echo "== WinTile: survives disable/enable (screen lock) =="
+node tests/lifecycle_test.js wintile@nowsci.com/extension.js
+
 echo; echo "== WinTile: drag to arrange =="
 node tests/arrange_test.js wintile@nowsci.com/extension.js
 

@@ -247,8 +247,14 @@ journalctl -qf | grep -i -e wintile -e 'js error'
 journalctl --user -u focus-opacity.service -f
 ```
 
-- **Nothing changes after install.** Reload the shell (step 3); extension code is only read
-  at start-up.
+- **Nothing changes after install or an update.** Restart the shell in place (`Alt`+`F2`, `r`,
+  `Enter` on X11). Extension code is only read at start-up: switching the extension off and on
+  again does **not** load new code. After that restart GNOME opens the Activities overview;
+  press `Esc`.
+- **Auto-tile stopped reacting (new windows, dragging) after I locked the screen.** Fixed in the
+  current version: GNOME disables and re-enables the extension on every lock and unlock, and
+  older versions did not re-attach auto-tiling afterwards. If you are on an older copy, run
+  `Super`+`Shift`+`T` twice, or update.
 - **`Failed to add keybinding: '<Super><Control>left'`** in the log means another program or
   extension already owns that shortcut. WinTile still works, but its "grow tile" shortcut for
   that key does not. Find the other owner in *Settings → Keyboard* or disable the conflicting
@@ -278,7 +284,8 @@ The WinTile tests run the **real** layout, resize and drag-swap functions from
 landscape output is identical to the version before orientation support
 (`tests/fixtures/`), that portrait stacks up to 3 and pairs from 4, that windows with a minimum
 size larger than their tile are re-laid out instead of overlapping, and that every drop zone
-arranges windows where you drop them (and refuses what cannot fit).
+arranges windows where you drop them (and refuses what cannot fit), and that auto-tile
+re-attaches after the extension is disabled and enabled (a screen lock and unlock).
 The install test runs `install.sh` / `uninstall.sh` in a throw-away `HOME` with stand-ins for
 `systemctl` and `gnome-extensions`, so it cannot touch your system.
 
