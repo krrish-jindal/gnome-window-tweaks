@@ -60,3 +60,15 @@ Modified `extension.js`:
   is remembered and the next layout picks the split into columns/rows in which the windows
   fit, and sizes the tiles unequally where that helps (a wide window and a narrow one can
   share a row that two wide ones could not), instead of letting windows overlap.
+
+### 2026-11-21 (later) — drag to arrange
+
+Modified `extension.js`:
+
+- **Drop zones.** Dropping a dragged tile on the middle of another swaps them; on a side edge
+  puts it beside the target; on the top or bottom edge puts it above or below (the roles of
+  the two pairs trade places on a landscape monitor, where the lanes are columns).
+- The result is kept per monitor as explicit rows of windows and takes precedence over the
+  automatic layout while the orientation holds and every window's minimum size still fits; new
+  windows get a lane of their own, closed ones drop out.
+- A drop that cannot fit is refused: the outline turns red and a notification says why.

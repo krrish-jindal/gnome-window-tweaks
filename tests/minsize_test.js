@@ -7,7 +7,7 @@ const vm = require('vm');
 
 const src = fs.readFileSync(process.argv[2], 'utf8');
 const names = ['splitSpan', 'splitSpanWeighted', 'autoTileStructure', 'preferredRowCounts', 'structureViolation', 'fitWeights', 'minsKeyOf', 'autoTileGap',
-    'evenLayoutState', 'autoTileRects', 'isTileCandidate', 'isBlacklisted', 'retileAll', 'autoTileKey',
+    'evenLayoutState', 'autoTileRects', 'isTileCandidate', 'isBlacklisted', 'retileAll', 'autoTileKey', 'reconcileRows', 'rowsFeasible',
     'scheduleVerify', 'verifyTiles'];
 let code = '';
 for (const n of names) {
@@ -28,6 +28,7 @@ function makeEnv(monitors) {
         wins: [], monitors, retileScheduled: 0, grabOp: 0,
         config: {gap: G, autoTile: true, autoTileBlacklist: []},
         Meta: {WindowType: {NORMAL: 0}, GrabOp: {NONE: 0}},
+        Main: {notify() {}},
         _log() {},
         GLib: {SOURCE_REMOVE: false, SOURCE_CONTINUE: true, timeout_add: () => 7, source_remove() {}},
         getMonitorInfo: i => env.monitors[i],
@@ -47,7 +48,7 @@ function makeEnv(monitors) {
     env.getActiveWorkspace = () => env.workspace;
     vm.createContext(env);
     vm.runInContext('let windowMoving = false, autoTiling = false, verifyTimer = null; ' +
-        'const layoutState = new Map();', env);
+        'const layoutState = new Map(); const arrangement = new Map();', env);
     vm.runInContext(code, env);
     return env;
 }

@@ -37,10 +37,20 @@ Everything upstream WinTile does (`Super`+arrows tiling, grid previews, gaps), p
   fit in a 1080 px screen), so they get a row each while the others still pair up. On a
   landscape screen it can mean stacking instead of two columns. With no such windows nothing
   changes.
-- **Drag to swap.** Drag a tiled window by its title bar onto another tile on the **same
-  monitor** and drop it: the two trade places. A soft blue outline shows the tile you would
-  swap with. Dropped anywhere else (empty desktop, another monitor, over a dialog) the
-  window just returns to its own slot.
+- **Drag to arrange.** Drag a tiled window by its title bar onto another tile on the **same
+  monitor**. Where on that tile you drop decides what happens, and a soft outline shows it
+  first:
+  - **middle of the tile:** the two windows swap places;
+  - **left or right edge:** the window sits **beside** it (portrait: in its row; landscape: it
+    starts a new column on that side);
+  - **top or bottom edge:** the window goes **above or below** it (portrait: a new row;
+    landscape: in its column).
+
+  What you arrange is remembered for that monitor and **wins over the automatic layout**, even
+  when windows open or close. If a drop cannot fit, because the two windows' minimum sizes do
+  not add up to the room (two browsers cannot share a 1080 px row), the outline turns **red**
+  and WinTile tells you; nothing moves. Dropped anywhere else (empty desktop, another monitor,
+  over a dialog) the window just returns to its own slot.
 - **Even gaps** around and between tiles (`gap` setting).
 - **Hand-resize follows.** Dragging an edge shared with a neighbour resizes the neighbour to
   match, so the screen stays gapless. Dragging an edge on the *screen border* floats that
@@ -52,7 +62,9 @@ Good to know:
 
 - Slot sizes stay with the **slot**, not the window: if you hand-resized one tile and then
   swap, the other window takes that size.
-- A new window always goes last. Switching auto-tile off and on again clears swaps.
+- A window that opens later gets a row (portrait) or column (landscape) of its own at the end; a
+  closed window just drops out. Rotating a monitor, or switching auto-tile off and on again,
+  clears your arrangement and goes back to the automatic layout.
 - While enabled, WinTile takes over GNOME's own `Super`+arrow maximise/half-tile shortcuts;
   disabling the extension gives them back.
 
@@ -250,7 +262,8 @@ journalctl --user -u focus-opacity.service -f
   fixes it. If it still overlaps, there are probably more windows than fit on that monitor:
   add some to the never-tile list or move them to another monitor. Always-on-top windows
   (such as a pinned terminal) are never tiled and float over the layout on purpose.
-- **A window seems stuck in a slot.** Dragging it onto another tile now swaps them. To free a
+- **A window seems stuck in a slot.** Drag it onto another tile: the middle swaps, an edge puts
+  it beside / above / below. To free a
   window completely, drag one of its screen-border edges (it floats), or add it to the
   never-tile list.
 
@@ -264,8 +277,8 @@ The WinTile tests run the **real** layout, resize and drag-swap functions from
 `extension.js` against fake windows and a fake pointer. They check, among other things, that
 landscape output is identical to the version before orientation support
 (`tests/fixtures/`), that portrait stacks up to 3 and pairs from 4, that windows with a minimum
-size larger than their tile are re-laid out instead of overlapping, and that swaps keep
-hand-resized sizes.
+size larger than their tile are re-laid out instead of overlapping, and that every drop zone
+arranges windows where you drop them (and refuses what cannot fit).
 The install test runs `install.sh` / `uninstall.sh` in a throw-away `HOME` with stand-ins for
 `systemctl` and `gnome-extensions`, so it cannot touch your system.
 

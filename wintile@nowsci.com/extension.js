@@ -1641,11 +1641,43 @@ function retileAll() {
             }
 
             const monitor = getMonitorInfo(idx);
+            // What the user arranged by dragging wins over the automatic layout,
+            // for as long as the orientation holds and every window still fits.
+            let arranged = null;
+            const saved = arrangement.get(key);
+            if (saved && saved.portrait === !!monitor.isPortrait) {
+                const rows = reconcileRows(saved.rows, candidates);
+                if (rowsFeasible(monitor, rows)) {
+                    arranged = rows;
+                } else {
+                    _log(`retileAll) ${key} the arrangement no longer fits; back to automatic`);
+                    arrangement.delete(key);
+                    Main.notify('WinTile', 'A window is too large for your arrangement; back to the automatic layout.');
+                }
+            } else if (saved) {
+                arrangement.delete(key);
+            }
+            if (arranged) {
+                // `candidates` is sorted by key: hand the same keys out in the
+                // arranged order so the layout order follows the rows.
+                const keys = candidates.map(autoTileKey);
+                const ordered = arranged.flat();
+                ordered.forEach((w, i) => {
+                    w.wintileOrder = keys[i];
+                });
+                candidates.splice(0, candidates.length, ...ordered);
+                arrangement.set(key, {
+                    portrait: !!monitor.isPortrait,
+                    rows: arranged.map(r => r.map(w => w.get_stable_sequence())),
+                });
+            }
             // Floating windows are counted in the structure even though they are
             // not placed, so their slot stays reserved and the windows around
             // them never shuffle just because one left the layout.
             const mins = candidates.map(a => a.wintileMin);
-            const structure = autoTileStructure(monitor, candidates.length, mins);
+            const structure = arranged
+                ? {columns: arranged.length, rowCounts: arranged.map(r => r.length), portrait: !!monitor.isPortrait}
+                : autoTileStructure(monitor, candidates.length, mins);
             // Weights only describe the structure they were built for.
             // That includes the orientation: rotating a monitor turns left/right
             // into up/down, so weights from the old arrangement must not carry over.
@@ -1780,13 +1812,27 @@ function verifyTiles() {
 
 // --- Drag to swap -----------------------------------------------------------
 // Dragging a tiled window by its title bar and dropping it on another tile on
-// the same monitor trades their places. Which slot a window takes is its sort
-// key -- creation order unless swapped -- so a swap just exchanges two keys and
-// the next relayout does the rest. Dropped anywhere else, the window goes back to
-// its own slot as before.
+// the same monitor arranges the two by WHERE on the tile it lands:
+//   middle of the tile   swap places with it
+//   a side edge          sit beside it, in its row (portrait) or column (landscape)
+//   top/bottom edge      go above or below it
+// (on a landscape screen the two pairs trade roles: the lanes are columns there).
+// The result is remembered per monitor as explicit rows of windows and wins over
+// the automatic layout for as long as it still fits and the orientation holds;
+// windows that open later get a lane of their own, closed ones simply drop out.
+// A drop that cannot fit, because the windows' minimum sizes do not add up to the
+// room, is refused: the outline turns red and a message says so. Dropped anywhere
+// else, the window goes back to its own slot as before.
 let swapDrag = null;       // { app, monitor, cx, cy } while a candidate is dragged
 let swapDragTimer = null;  // polls the pointer to move the highlight
-let swapHighlight = null;  // soft outline over the tile that would be swapped
+let swapHighlight = null;  // soft outline over where the dragged window would land
+const SWAP_STYLE_OK = 'background-color: rgba(120, 160, 255, 0.28); ' +
+    'border: 2px solid rgba(120, 160, 255, 0.9); border-radius: 12px;';
+const SWAP_STYLE_NO = 'background-color: rgba(255, 90, 90, 0.25); ' +
+    'border: 2px solid rgba(255, 90, 90, 0.9); border-radius: 12px;';
+// `workspace:monitor` -> { portrait, rows: [[stable sequence, ...], ...] }: what the
+// user arranged by dragging. Rows are lanes: rows in portrait, columns in landscape.
+const arrangement = new Map();
 
 /**
  * Sort key deciding which slot a window takes: its creation order, unless the
@@ -1800,16 +1846,208 @@ function autoTileKey(app) {
 }
 
 /**
- * Trade two windows' places in the layout by exchanging their sort keys.
+ * Key under which a monitor's layout is remembered on the active workspace.
  *
- * @param {object} a - one window
- * @param {object} b - the other window
+ * @param {number} monitorIndex - monitor index
+ * @returns {string} `workspace:monitor`
  */
-function swapAutoTileOrder(a, b) {
-    const keyA = autoTileKey(a);
-    const keyB = autoTileKey(b);
-    a.wintileOrder = keyB;
-    b.wintileOrder = keyA;
+function layoutKey(monitorIndex) {
+    return `${global.workspace_manager.get_active_workspace_index()}:${monitorIndex}`;
+}
+
+/**
+ * Every tileable window of a monitor on the active workspace, in layout order.
+ *
+ * @param {number} monitorIndex - monitor index
+ * @returns {Array} windows sorted by their layout key
+ */
+function tileCandidates(monitorIndex) {
+    const out = getActiveWorkspace().list_windows()
+        .filter(w => w.get_monitor() === monitorIndex && isTileCandidate(w));
+    out.sort((a, b) => autoTileKey(a) - autoTileKey(b));
+    return out;
+}
+
+/**
+ * Bring a remembered arrangement up to date with the windows that exist now:
+ * closed windows drop out, empty rows vanish, and a window that opened since gets
+ * a lane of its own at the end.
+ *
+ * @param {Array} savedRows - [[stable sequence, ...], ...]
+ * @param {Array} candidates - the monitor's current tileable windows
+ * @returns {Array} [[window, ...], ...]
+ */
+function reconcileRows(savedRows, candidates) {
+    const byId = new Map(candidates.map(a => [a.get_stable_sequence(), a]));
+    const rows = [];
+    for (const ids of savedRows) {
+        const row = [];
+        for (const id of ids) {
+            if (byId.has(id)) {
+                row.push(byId.get(id));
+                byId.delete(id);
+            }
+        }
+        if (row.length)
+            rows.push(row);
+    }
+    for (const w of byId.values())
+        rows.push([w]);
+    return rows;
+}
+
+/**
+ * How the monitor's windows are laid out right now, as rows of windows: the
+ * user's arrangement if there is one, otherwise whatever structure the last
+ * layout used.
+ *
+ * @param {number} monitorIndex - monitor index
+ * @param {Array} candidates - the monitor's tileable windows in layout order
+ * @returns {Array} [[window, ...], ...]
+ */
+function currentRows(monitorIndex, candidates) {
+    const key = layoutKey(monitorIndex);
+    const monitor = getMonitorInfo(monitorIndex);
+    const saved = arrangement.get(key);
+    if (saved && saved.portrait === !!monitor.isPortrait)
+        return reconcileRows(saved.rows, candidates);
+
+    const state = layoutState.get(key);
+    let rowCounts = null;
+    if (state && state.rowCounts && state.rowCounts.reduce((x, y) => x + y, 0) === candidates.length)
+        rowCounts = state.rowCounts;
+    if (!rowCounts)
+        rowCounts = autoTileStructure(monitor, candidates.length, candidates.map(w => w.wintileMin)).rowCounts;
+    const rows = [];
+    let i = 0;
+    for (const n of rowCounts) {
+        rows.push(candidates.slice(i, i + n));
+        i += n;
+    }
+    return rows;
+}
+
+/**
+ * Whether the windows' known minimum sizes fit in an arrangement.
+ *
+ * @param {object} monitor - monitor info from getMonitorInfo()
+ * @param {Array} rows - [[window, ...], ...]
+ * @returns {boolean} true when nothing would be squeezed below its minimum
+ */
+function rowsFeasible(monitor, rows) {
+    const structure = {
+        columns: rows.length,
+        rowCounts: rows.map(r => r.length),
+        portrait: !!monitor.isPortrait,
+    };
+    return structureViolation(monitor, structure, rows.flat().map(w => w.wintileMin)) === 0;
+}
+
+/**
+ * Where on a tile the pointer is: the middle swaps, an edge means "beside" or
+ * "above/below". The pointer may be in the gap just outside the tile; it counts
+ * as the nearest edge.
+ *
+ * @param {object} target - the tile under the pointer
+ * @returns {string} 'swap', 'left', 'right', 'top' or 'bottom'
+ */
+function dropZone(target) {
+    const [px, py] = global.get_pointer();
+    const r = target.get_frame_rect();
+    const fx = Math.min(1, Math.max(0, (px - r.x) / r.width));
+    const fy = Math.min(1, Math.max(0, (py - r.y) / r.height));
+    const dist = {left: fx, right: 1 - fx, top: fy, bottom: 1 - fy};
+    const nearest = Object.keys(dist).reduce((a, b) => (dist[b] < dist[a] ? b : a));
+    return dist[nearest] >= 0.25 ? 'swap' : nearest;
+}
+
+/**
+ * The part of a tile that a drop would take, for the outline.
+ *
+ * @param {object} r - the tile's frame rect
+ * @param {string} zone - from dropZone()
+ * @returns {object} { x, y, w, h }
+ */
+function zoneRect(r, zone) {
+    const hw = Math.round(r.width / 2);
+    const hh = Math.round(r.height / 2);
+    switch (zone) {
+    case 'left': return {x: r.x, y: r.y, w: hw, h: r.height};
+    case 'right': return {x: r.x + r.width - hw, y: r.y, w: hw, h: r.height};
+    case 'top': return {x: r.x, y: r.y, w: r.width, h: hh};
+    case 'bottom': return {x: r.x, y: r.y + r.height - hh, w: r.width, h: hh};
+    default: return {x: r.x, y: r.y, w: r.width, h: r.height};
+    }
+}
+
+/**
+ * Work out what dropping `app` on `target` at `zone` would do, without doing it.
+ *
+ * @param {object} app - the dragged window
+ * @param {object} target - the tile it is over
+ * @param {string} zone - from dropZone()
+ * @param {number} monitorIndex - monitor of the drag
+ * @returns {object|null} { rows, candidates, fits, same } or null if either window is not tiled here
+ */
+function proposeDrop(app, target, zone, monitorIndex) {
+    const monitor = getMonitorInfo(monitorIndex);
+    const candidates = tileCandidates(monitorIndex);
+    if (!candidates.includes(app) || !candidates.includes(target))
+        return null;
+    const rows = currentRows(monitorIndex, candidates).map(r => r.slice());
+    const describe = rs => rs.map(r => r.map(w => w.get_stable_sequence()).join('.')).join('|');
+    const before = describe(rows);
+    const portrait = !!monitor.isPortrait;
+    const locate = w => {
+        for (let i = 0; i < rows.length; i++) {
+            const j = rows[i].indexOf(w);
+            if (j >= 0)
+                return [i, j];
+        }
+        return [-1, -1];
+    };
+
+    if (zone === 'swap') {
+        const [ai, aj] = locate(app);
+        const [ti, tj] = locate(target);
+        rows[ai][aj] = target;
+        rows[ti][tj] = app;
+    } else {
+        const [ai, aj] = locate(app);
+        rows[ai].splice(aj, 1);
+        if (rows[ai].length === 0)
+            rows.splice(ai, 1);
+        const [ti, tj] = locate(target);
+        // Beside the target means in its lane: left/right in portrait, top/bottom in landscape.
+        const beforeInLane = portrait ? zone === 'left' : zone === 'top';
+        const afterInLane = portrait ? zone === 'right' : zone === 'bottom';
+        if (beforeInLane || afterInLane) {
+            rows[ti].splice(beforeInLane ? tj : tj + 1, 0, app);
+        } else {
+            const newLaneBefore = portrait ? zone === 'top' : zone === 'left';
+            rows.splice(newLaneBefore ? ti : ti + 1, 0, [app]);
+        }
+    }
+    return {rows, candidates, fits: rowsFeasible(monitor, rows), same: describe(rows) === before};
+}
+
+/**
+ * Make an arrangement the layout: remember it, and give the windows sort keys in
+ * its order (reusing the same keys, so the window set is unchanged).
+ *
+ * @param {number} monitorIndex - monitor index
+ * @param {Array} rows - [[window, ...], ...]
+ * @param {Array} candidates - the monitor's tileable windows, sorted by key
+ */
+function applyRows(monitorIndex, rows, candidates) {
+    const keys = candidates.map(autoTileKey);
+    rows.flat().forEach((w, i) => {
+        w.wintileOrder = keys[i];
+    });
+    arrangement.set(layoutKey(monitorIndex), {
+        portrait: !!getMonitorInfo(monitorIndex).isPortrait,
+        rows: rows.map(r => r.map(w => w.get_stable_sequence())),
+    });
 }
 
 /**
@@ -1874,7 +2112,7 @@ function stopSwapDrag() {
 }
 
 /**
- * Timer callback: outline the tile the drag would swap with, if any.
+ * Timer callback: outline where the dragged window would land, red if it cannot.
  *
  * @returns {boolean} GLib.SOURCE_CONTINUE while the drag lasts
  */
@@ -1886,13 +2124,21 @@ function updateSwapHighlight() {
     }
     try {
         let target = null;
-        if (swapDragMoved(drag, drag.app) && drag.app.get_monitor() === drag.monitor)
+        let zone = null;
+        let plan = null;
+        if (swapDragMoved(drag, drag.app) && drag.app.get_monitor() === drag.monitor) {
             target = findSwapTarget(drag.app, drag.monitor);
-        if (swapHighlight) {
             if (target) {
-                const r = target.get_frame_rect();
+                zone = dropZone(target);
+                plan = proposeDrop(drag.app, target, zone, drag.monitor);
+            }
+        }
+        if (swapHighlight) {
+            if (target && plan) {
+                const r = zoneRect(target.get_frame_rect(), zone);
                 swapHighlight.set_position(r.x, r.y);
-                swapHighlight.set_size(r.width, r.height);
+                swapHighlight.set_size(r.w, r.h);
+                swapHighlight.set_style(plan.fits ? SWAP_STYLE_OK : SWAP_STYLE_NO);
                 swapHighlight.show();
             } else {
                 swapHighlight.hide();
@@ -1928,8 +2174,7 @@ function beginSwapDrag(app) {
     };
     try {
         swapHighlight = new St.Widget({
-            style: 'background-color: rgba(120, 160, 255, 0.28); ' +
-                'border: 2px solid rgba(120, 160, 255, 0.9); border-radius: 12px;',
+            style: SWAP_STYLE_OK,
             visible: false,
             reactive: false,
         });
@@ -1944,10 +2189,10 @@ function beginSwapDrag(app) {
 
 /**
  * A move grab ended: if the window was dropped on another tile on the same
- * monitor, trade their places.
+ * monitor, arrange it there by where on the tile it landed.
  *
  * @param {object} app - the window that was dragged
- * @returns {boolean} true when a swap was made
+ * @returns {boolean} true when the arrangement changed
  */
 function endSwapDrag(app) {
     const drag = swapDrag;
@@ -1959,8 +2204,17 @@ function endSwapDrag(app) {
     const target = findSwapTarget(app, drag.monitor);
     if (!target)
         return false;
-    _log(`endSwapDrag) swapping ${app.get_wm_class()} with ${target.get_wm_class()}`);
-    swapAutoTileOrder(app, target);
+    const zone = dropZone(target);
+    const plan = proposeDrop(app, target, zone, drag.monitor);
+    if (!plan || plan.same)
+        return false;
+    if (!plan.fits) {
+        _log(`endSwapDrag) ${zone} drop of ${app.get_wm_class()} on ${target.get_wm_class()} does not fit`);
+        Main.notify('WinTile', 'That arrangement will not fit: one of those windows cannot be made small enough.');
+        return false;
+    }
+    _log(`endSwapDrag) ${app.get_wm_class()} -> ${zone} of ${target.get_wm_class()}`);
+    applyRows(drag.monitor, plan.rows, plan.candidates);
     return true;
 }
 
@@ -1994,6 +2248,7 @@ function autoTileConnect() {
         }
     }
     layoutState.clear();
+    arrangement.clear();
     scheduleRetile(0);
 }
 
@@ -2176,6 +2431,7 @@ function autoTileDisconnect() {
         verifyTimer = null;
     }
     layoutState.clear();
+    arrangement.clear();
     if (autoTileTimer) {
         GLib.source_remove(autoTileTimer);
         autoTileTimer = null;
