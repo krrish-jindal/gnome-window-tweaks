@@ -6,7 +6,7 @@ const fs = require('fs');
 const vm = require('vm');
 
 const src = fs.readFileSync(process.argv[2], 'utf8');
-const names = ['splitSpan', 'splitSpanWeighted', 'autoTileStructure', 'preferredRowCounts', 'structureViolation', 'autoTileGap',
+const names = ['splitSpan', 'splitSpanWeighted', 'autoTileStructure', 'preferredRowCounts', 'structureViolation', 'fitWeights', 'minsKeyOf', 'autoTileGap',
     'evenLayoutState', 'autoTileRects', 'isTileCandidate', 'isBlacklisted', 'retileAll', 'autoTileKey',
     'scheduleVerify', 'verifyTiles'];
 let code = '';
@@ -90,14 +90,19 @@ console.log('1. how windows are split into lanes, with and without known minimum
     // portrait: Brave-like windows (578 wide) fit a full-width stack of 3
     ok(split(port, 3, [{w: 578, h: 110}, {w: 578, h: 110}, {w: 373, h: 100}]) === '1,1,1', 'portrait: 578px-wide minimums fit a full-width stack');
 
-    // THE REPORTED CASE: 4 windows in portrait. Normal windows pair up as a 2x2 grid ...
+    // THE REPORTED CASE: 4 windows in portrait. Ordinary windows pair up as a 2x2 grid ...
     ok(split(port, 4, Array(4).fill({w: 373, h: 100})) === '2,2', 'portrait n=4 with narrow-enough windows: 2x2 grid');
-    // ... but two 578px-wide windows (Brave) cannot share a 1080px row (2x531 < 2x578): give them a row each,
-    // and let the two narrow windows still pair up.
+    // ... two 578px-wide windows (Brave) cannot share a 1080px row (578+578 > 1062) ...
     const wide = {w: 578, h: 110}, narrow = {w: 373, h: 100};
-    ok(split(port, 4, [wide, wide, narrow, narrow]) === '1,1,2', `portrait n=4, two wide + two narrow: want 1,1,2, got ${split(port, 4, [wide, wide, narrow, narrow])}`);
-    ok(split(port, 4, [wide, narrow, wide, narrow]) === '1,1,1,1' || env.structureViolation(port, env.autoTileStructure(port, 4, [wide, narrow, wide, narrow]), [wide, narrow, wide, narrow]) === 0,
-        'portrait n=4 interleaved wide/narrow: must still be a zero-overlap layout');
+    // ... but a wide window and a narrow one CAN (578+373 <= 1062) when the widths are not forced equal.
+    ok(split(port, 4, [wide, narrow, wide, narrow]) === '2,2', `wide+narrow rows: want 2,2, got ${split(port, 4, [wide, narrow, wide, narrow])}`);
+    ok(split(port, 4, [narrow, wide, wide, narrow]) === '2,2', 'narrow+wide, wide+narrow: 2x2 as well');
+    // two wide ones in a row would not fit: the wide pair is split up, the rest still pair
+    ok(split(port, 4, [wide, wide, narrow, narrow]) === '1,2,1', `two wide + two narrow: want 1,2,1, got ${split(port, 4, [wide, wide, narrow, narrow])}`);
+    // windows whose minimum is not known yet must never be crammed three to a row
+    ok(split(port, 4, [wide, wide, undefined, undefined]) === '1,2,1', `two wide + two unknown: want 1,2,1, got ${split(port, 4, [wide, wide, undefined, undefined])}`);
+    ok(Math.max(...env.autoTileStructure(port, 6, [wide, wide, wide, undefined, undefined, undefined]).rowCounts) <= 2, 'no row ever holds more than 2 when a layout with at most 2 exists');
+    ok(split(port, 4, [wide, wide, wide, narrow]) === '1,1,2', `three wide + one narrow: want 1,1,2, got ${split(port, 4, [wide, wide, wide, narrow])}`);
     // all four wide: nothing can pair up, so a full stack is the only fit
     ok(split(port, 4, Array(4).fill(wide)) === '1,1,1,1', 'portrait n=4, all wide: full stack');
     // every chosen layout really has zero shortfall when one exists
@@ -115,6 +120,43 @@ console.log('1. how windows are split into lanes, with and without known minimum
     const many = env.autoTileStructure(port, 14, Array(14).fill({w: 300, h: 100}));
     ok(many.rowCounts.reduce((a, b) => a + b, 0) === 14, 'a 14-window layout is still valid');
     console.log('  landscape keeps columns; portrait stacks to 3 then pairs; wide windows get their own row while the rest pair up');
+}
+
+// ---- 1b. sizing tiles around minimums ----
+console.log('1b. fitWeights / evenLayoutState size tiles to their minimums');
+{
+    const env = makeEnv([]);
+    const near = (x, y) => Math.abs(x - y) < 1;
+    const fw = (...a) => env.fitWeights(...a);
+    ok(fw(1080, 6, [0, 0]).join() === '1,1', 'no minimums: an even split (all ones)');
+    ok(fw(1080, 6, [300, 300]).join() === '1,1', 'minimums that fit an even share: still all ones');
+    let w = fw(1080, 6, [578, 373]);
+    ok(near(w[0], 578) && near(w[1], 484), `578 + 373 in a 1062px row: want ~[578,484], got [${w.map(Math.round)}]`);
+    w = fw(1080, 6, [100, 700, 100]);
+    ok(near(w[0], 178) && near(w[1], 700) && near(w[2], 178), `one big minimum: want ~[178,700,178], got [${w.map(Math.round)}]`);
+    w = fw(1080, 6, [400, 500, 100]);
+    ok(near(w[0], 400) && near(w[1], 500) && near(w[2], 156), `two pinned: want ~[400,500,156], got [${w.map(Math.round)}]`);
+    w = fw(1080, 6, [350, 345, 360]);   // pinning one forces the next to be pinned too
+    ok(near(w[0], 350) && near(w[2], 360) && near(w[0] + w[1] + w[2], 1056), `cascade: got [${w.map(Math.round)}]`);
+    w = fw(1080, 6, [578, 578]);        // cannot fit: scaled down together, never exceeds the span
+    ok(near(w[0] + w[1], 1062) && near(w[0], w[1]), `impossible: want an even 531/531, got [${w.map(Math.round)}]`);
+    ok(fw(1080, 6, [900]).length === 1 && fw(1080, 6, [900])[0] > 0, 'a single tile always gets positive size');
+
+    // evenLayoutState: the pair row is sized unequally, everything else stays even
+    const port = monInfo(0, 0, 1080, 1920);
+    const mins = [{w: 578, h: 110}, {w: 373, h: 100}];
+    const st = env.autoTileStructure(port, 2, mins);          // 2 windows: preferred is a stack...
+    const pair = {columns: 1, rowCounts: [2], portrait: true};   // ...so build the pair explicitly
+    const state = env.evenLayoutState(pair, 'p', mins, port);
+    ok(near(state.rowWeights[0][0], 578) && near(state.rowWeights[0][1], 484), `pair row weights: got [${state.rowWeights[0].map(Math.round)}]`);
+    ok(state.colWeights.join() === '1', 'lane axis stays even');
+    ok(state.minsKey === env.minsKeyOf(mins) && state.minsKey !== '', 'the layout remembers which minimums it was sized around');
+    const plain = env.evenLayoutState(st, 'p');
+    ok(plain.minsKey === '' && plain.colWeights.every(x => x === 1) && plain.rowWeights.every(r => r.every(x => x === 1)), 'no minimums: all-ones state exactly as before');
+    const rects = env.autoTileRects(port, pair, state);
+    ok(rects[0].w >= 578 && rects[1].w >= 373 && rects[0].x + rects[0].w + G <= rects[1].x, `pair row geometry: ${JSON.stringify(rects.map(r => [r.x, r.w]))}`);
+    ok(rects[0].x === G && rects[1].x + rects[1].w === 1080 - G, 'pair row keeps even outer margins');
+    console.log('  a 578px window and a 373px one share a 1062px row as ~578 + ~484; impossible requests scale down safely');
 }
 
 // ---- 2. the full cycle: place -> window clamps -> learn -> relayout -> no overlap ----
@@ -148,14 +190,16 @@ console.log('3. portrait 1080x1920: two windows with a 578px minimum width + one
     console.log('  stacked at full width, no overlap, nothing to relearn');
 }
 
-// ---- 3b. the reported case: FOUR windows in portrait, two of them Brave-like ----
-console.log('3b. portrait 1080x1920, four windows, two with a 578px minimum width');
+// ---- 3b. the reported case: FOUR windows in portrait ----
+console.log('3b. portrait 1080x1920, four windows');
 {
-    const env = makeEnv([monInfo(1920, 0, 1080, 1920)]);
+    const port = monInfo(1920, 0, 1080, 1920);
+    // (i) two Brave-like windows (578px) + two narrow ones
+    const env = makeEnv([port]);
     const Y1 = win(env, 'brave', {w: 578, h: 110}), Y2 = win(env, 'brave', {w: 578, h: 110});
     const T = win(env, 'term', {w: 373, h: 100}), O = win(env, 'other', {w: 300, h: 100});
     env.retileAll();
-    ok(env.autoTileStructure(monInfo(1920, 0, 1080, 1920), 4).rowCounts.join() === '2,2', 'precondition: the unaware layout is the 2x2 grid');
+    ok(env.autoTileStructure(port, 4).rowCounts.join() === '2,2', 'precondition: the unaware layout is the 2x2 grid');
     ok(overlaps(Y1, Y2), 'precondition: in that grid the two 578px windows collide in a 531px tile');
     env.verifyTiles();
     ok(Y1.wintileMin && Y2.wintileMin && !T.wintileMin && !O.wintileMin,
@@ -163,14 +207,30 @@ console.log('3b. portrait 1080x1920, four windows, two with a 578px minimum widt
     ok(env.retileScheduled === 1, 'exactly one relayout should be requested');
     env.retileAll();
     ok(!anyOverlap([Y1, Y2, T, O]), 'after the relayout nothing overlaps');
-    ok(Y1.rect.width === 1080 - 2 * G && Y2.rect.width === 1080 - 2 * G && Y1.rect.y < Y2.rect.y, 'the wide windows get a full-width row each');
-    ok(T.rect.y === O.rect.y && T.rect.x < O.rect.x && T.rect.y > Y2.rect.y, 'the two narrow windows still sit side by side, below them');
+    ok(Y1.rect.width === 1080 - 2 * G && O.rect.width === 1080 - 2 * G, 'the first and last windows get a full-width row');
+    ok(Y2.rect.y === T.rect.y && Y2.rect.x < T.rect.x && Y2.rect.width >= 578 && T.rect.width >= 373,
+        'the second wide window shares a row with the narrow one, side by side, each at least its minimum');
     env.retileScheduled = 0; env.verifyTiles();
     ok(env.retileScheduled === 0, 'and the layout is stable');
-    console.log('  2x2 first, the two wide windows are learned, then: row, row, and a side-by-side pair');
+    console.log('  row | wide + narrow side by side | row: no overlap, stable');
 
-    // four ordinary windows: a real 2x2 grid, nothing to learn
-    const env2 = makeEnv([monInfo(1920, 0, 1080, 1920)]);
+    // (ii) the real set on your portrait monitor: Brave, btop, Brave, Chrome
+    const env3 = makeEnv([port]);
+    const B1 = win(env3, 'brave', {w: 578, h: 61}), BT = win(env3, 'btop', {w: 283, h: 87});
+    const B2 = win(env3, 'brave', {w: 578, h: 61}), CH = win(env3, 'chrome', {w: 638, h: 101});
+    env3.retileAll(); env3.verifyTiles(); env3.retileAll();
+    ok(env3.autoTileStructure(port, 4, [B1, BT, B2, CH].map(w => w.wintileMin)).rowCounts.join() === '2,1,1', 'your four windows settle as 2,1,1');
+    ok(!anyOverlap([B1, BT, B2, CH]), 'your four windows: no overlap');
+    ok(B1.rect.y === BT.rect.y && B1.rect.x < BT.rect.x && B1.rect.width >= 578 && BT.rect.width >= 283,
+        'first row: Brave on the left, btop on the right');
+    ok(B2.rect.width === 1080 - 2 * G && CH.rect.width === 1080 - 2 * G && B2.rect.y > B1.rect.y && CH.rect.y > B2.rect.y,
+        'then Brave and Chrome get a full-width row each');
+    env3.retileScheduled = 0; env3.verifyTiles();
+    ok(env3.retileScheduled === 0, 'and that is stable');
+    console.log('  your set (Brave, btop, Brave, Chrome): Brave | btop on top, then one row each');
+
+    // (iii) four ordinary windows: a real 2x2 grid, nothing to learn
+    const env2 = makeEnv([port]);
     const ws = [1, 2, 3, 4].map(i => win(env2, 'app' + i, {w: 373, h: 100}));
     env2.retileAll(); env2.verifyTiles();
     ok(!anyOverlap(ws) && env2.retileScheduled === 0, 'four ordinary windows: no overlap, nothing to relearn');

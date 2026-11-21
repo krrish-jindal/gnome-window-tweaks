@@ -6,8 +6,8 @@ const vm = require('vm');
 function load(path, cfg) {
     const src = fs.readFileSync(path, 'utf8');
     const names = ['splitSpan', 'splitSpanWeighted', 'autoTileStructure', 'autoTileGap',
-        'evenLayoutState', 'autoTileRects', 'shiftBoundary', 'applyManualResize', 'structureViolation', 'preferredRowCounts'];
-    const optional = ['structureViolation', 'preferredRowCounts'];   // absent from the pre-orientation fixture
+        'evenLayoutState', 'autoTileRects', 'shiftBoundary', 'applyManualResize', 'structureViolation', 'preferredRowCounts', 'fitWeights', 'minsKeyOf'];
+    const optional = ['structureViolation', 'preferredRowCounts', 'fitWeights', 'minsKeyOf'];   // absent from the pre-orientation fixture
     let code = '';
     for (const n of names) {
         const m = new RegExp(`^function ${n}\\(`, 'm').exec(src);

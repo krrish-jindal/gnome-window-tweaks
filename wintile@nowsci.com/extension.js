@@ -1313,12 +1313,18 @@ function autoTileStructure(monitor, count, mins) {
         return lanes;
     };
     const wantedLane = laneOf(wanted);
+    const wantedMax = Math.max(...wanted);
     const distance = rowCounts => {
         let moved = Math.abs(rowCounts.length - wanted.length);
         laneOf(rowCounts).forEach((lane, i) => {
             if (lane !== wantedLane[i])
                 moved++;
         });
+        // Crowding a lane beyond what the preferred layout does is a far bigger
+        // departure than moving a window. Windows whose minimum is not known yet
+        // count as zero, so without this they would be packed three to a row.
+        for (const n of rowCounts)
+            moved += Math.max(0, n - wantedMax) * 10;
         return moved;
     };
 
@@ -1381,8 +1387,11 @@ function preferredRowCounts(monitor, count) {
 }
 
 /**
- * How many pixels, summed over all windows, an even split of `structure` leaves
- * them short of their known minimum sizes. Zero means everything fits.
+ * How many pixels, summed over the lanes and the tiles inside them, the windows'
+ * known minimum sizes overshoot the room there is. Tiles do not have to be equal,
+ * so a lane is only short of room when its minimums together do not fit: a wide
+ * window and a narrow one can share a row that two wide ones could not. Zero
+ * means everything fits (see fitWeights() for how the room is then divided).
  *
  * @param {object} monitor - monitor info from getMonitorInfo()
  * @param {object} structure - from autoTileStructure()
@@ -1395,21 +1404,24 @@ function structureViolation(monitor, structure, mins) {
     // Lanes run along x on landscape and along y on portrait.
     const laneSpan = structure.portrait ? monitor.height : monitor.width;
     const itemSpan = structure.portrait ? monitor.width : monitor.height;
-    const laneLen = (laneSpan - gap * (lanes + 1)) / lanes;
+    const along = m => (m ? (structure.portrait ? m.h : m.w) : 0);
+    const across = m => (m ? (structure.portrait ? m.w : m.h) : 0);
+
     let total = 0;
+    let laneNeed = 0;
     let i = 0;
     for (let c = 0; c < lanes; c++) {
         const n = structure.rowCounts[c];
-        const itemLen = (itemSpan - gap * (n + 1)) / n;
+        let laneMin = 0;
+        let itemNeed = 0;
         for (let r = 0; r < n; r++, i++) {
-            const m = mins[i];
-            if (!m)
-                continue;
-            const w = structure.portrait ? itemLen : laneLen;
-            const h = structure.portrait ? laneLen : itemLen;
-            total += Math.max(0, m.w - w) + Math.max(0, m.h - h);
+            laneMin = Math.max(laneMin, along(mins[i]));
+            itemNeed += across(mins[i]);
         }
+        laneNeed += laneMin;
+        total += Math.max(0, itemNeed - (itemSpan - gap * (n + 1)));
     }
+    total += Math.max(0, laneNeed - (laneSpan - gap * (lanes + 1)));
     return total;
 }
 
@@ -1433,22 +1445,116 @@ function autoTileGap(monitor, structure) {
 }
 
 /**
- * Layout state with even weights: every column the same width, every row in a
- * column the same height.
+ * Relative sizes for `mins.length` tiles sharing a span, each at least its minimum
+ * where that is possible and otherwise as equal as possible. All ones (an even
+ * split) when every minimum already fits an even share.
+ *
+ * Tiles below their minimum are pinned to it and the room that is left is shared
+ * by the rest; if the minimums cannot all fit, everyone is scaled down together.
+ *
+ * @param {number} span - pixels available along the axis
+ * @param {number} gap - gap in px at both ends and between tiles
+ * @param {Array} mins - minimum size of each tile along the axis (0 = unknown)
+ * @returns {Array} one positive weight per tile
+ */
+function fitWeights(span, gap, mins) {
+    const n = mins.length;
+    const avail = span - gap * (n + 1);
+    const equal = avail / n;
+    if (avail <= 0 || mins.every(m => !(m > equal)))
+        return Array.from({length: n}, () => 1);
+
+    const sizes = Array.from({length: n}, () => equal);
+    const pinned = Array.from({length: n}, () => false);
+    for (;;) {
+        let more = false;
+        for (let i = 0; i < n; i++) {
+            if (!pinned[i] && sizes[i] < mins[i]) {
+                pinned[i] = true;
+                more = true;
+            }
+        }
+        if (!more)
+            break;
+        let pinnedTotal = 0;
+        let free = 0;
+        for (let i = 0; i < n; i++) {
+            if (pinned[i])
+                pinnedTotal += mins[i];
+            else
+                free++;
+        }
+        const share = free > 0 ? (avail - pinnedTotal) / free : 0;
+        for (let i = 0; i < n; i++)
+            sizes[i] = pinned[i] ? mins[i] : Math.max(1, share);
+        if (free === 0 || share <= 0)
+            break;
+    }
+    const total = sizes.reduce((x, y) => x + y, 0);
+    if (total > avail)
+        return sizes.map(s => s * avail / total);
+    return sizes;
+}
+
+/**
+ * A short string identifying the minimum sizes a layout was sized around, so a
+ * newly learned minimum can be told apart from "nothing changed".
+ *
+ * @param {Array} mins - per window: { w, h } or undefined
+ * @returns {string} '' when no minimum is known
+ */
+function minsKeyOf(mins) {
+    if (!mins || !mins.some(Boolean))
+        return '';
+    return JSON.stringify(mins.map(m => (m ? [Math.round(m.w), Math.round(m.h)] : 0)));
+}
+
+/**
+ * Layout state with the starting weights: even (every column the same width, every
+ * row in a column the same height), except where known minimum sizes need more
+ * room than an even share, in which case those tiles are sized up to their minimum
+ * and the others give way.
  *
  * @param {object} structure - from autoTileStructure()
  * @param {string} population - the window set these weights describe
+ * @param {Array} [mins] - per window, in layout order: { w, h } or undefined
+ * @param {object} [monitor] - monitor info, needed to size around the minimums
  * @returns {object} fresh layout state
  */
-function evenLayoutState(structure, population) {
-    return {
+function evenLayoutState(structure, population, mins, monitor) {
+    const state = {
         population,
         columns: structure.columns,
         portrait: !!structure.portrait,
         rowCounts: structure.rowCounts.slice(),
         colWeights: structure.rowCounts.map(() => 1),
         rowWeights: structure.rowCounts.map(n => Array.from({length: n}, () => 1)),
+        minsKey: minsKeyOf(mins),
     };
+    if (!state.minsKey || !monitor)
+        return state;
+
+    const gap = config.gap;
+    const laneSpan = structure.portrait ? monitor.height : monitor.width;
+    const itemSpan = structure.portrait ? monitor.width : monitor.height;
+    const along = m => (m ? (structure.portrait ? m.h : m.w) : 0);
+    const across = m => (m ? (structure.portrait ? m.w : m.h) : 0);
+    const laneMins = [];
+    const itemMins = [];
+    let i = 0;
+    for (const n of structure.rowCounts) {
+        let laneMin = 0;
+        const items = [];
+        for (let r = 0; r < n; r++, i++) {
+            laneMin = Math.max(laneMin, along(mins[i]));
+            items.push(across(mins[i]));
+        }
+        laneMins.push(laneMin);
+        itemMins.push(items);
+    }
+    state.colWeights = fitWeights(laneSpan, gap, laneMins);
+    state.rowWeights = itemMins.map(items => fitWeights(itemSpan, gap, items));
+    return state;
 }
 
 /**
@@ -1538,15 +1644,18 @@ function retileAll() {
             // Floating windows are counted in the structure even though they are
             // not placed, so their slot stays reserved and the windows around
             // them never shuffle just because one left the layout.
-            const structure = autoTileStructure(monitor, candidates.length,
-                candidates.map(a => a.wintileMin));
+            const mins = candidates.map(a => a.wintileMin);
+            const structure = autoTileStructure(monitor, candidates.length, mins);
             // Weights only describe the structure they were built for.
             // That includes the orientation: rotating a monitor turns left/right
             // into up/down, so weights from the old arrangement must not carry over.
+            // And the minimum sizes they were sized around: a newly learned minimum
+            // re-sizes the tiles so that window fits.
             if (state.columns !== structure.columns ||
                 state.portrait !== structure.portrait ||
-                state.rowCounts.join(',') !== structure.rowCounts.join(',')) {
-                state = evenLayoutState(structure, population);
+                state.rowCounts.join(',') !== structure.rowCounts.join(',') ||
+                state.minsKey !== minsKeyOf(mins)) {
+                state = evenLayoutState(structure, population, mins, monitor);
                 layoutState.set(key, state);
             }
 

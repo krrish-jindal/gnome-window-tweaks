@@ -32,8 +32,9 @@ Everything upstream WinTile does (`Super`+arrows tiling, grid previews, gaps), p
   Chromium-based browser is about 580 px wide), and a tile smaller than that makes the window
   spill over its neighbour. After each layout WinTile checks whether any window is still bigger
   than its tile; if so it remembers that window's minimum and re-lays out so everything fits.
-  On a portrait screen that means two windows that are too wide to share a row (two Brave
-  windows are each at least ~580 px) get a row each while the others still pair up; on a
+  Tiles do not have to be equal: a wide window and a narrow one can share a portrait row (a
+  ~580 px browser next to a ~480 px terminal), but two wide ones cannot (2 x ~580 px does not
+  fit in a 1080 px screen), so they get a row each while the others still pair up. On a
   landscape screen it can mean stacking instead of two columns. With no such windows nothing
   changes.
 - **Drag to swap.** Drag a tiled window by its title bar onto another tile on the **same

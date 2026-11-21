@@ -58,5 +58,5 @@ Modified `extension.js`:
 - **Minimum sizes.** After a layout the extension compares each window's real size with its
   tile; a window that is still larger has hit its application's minimum size. That minimum
   is remembered and the next layout picks the split into columns/rows in which the windows
-  fit (for example, giving two too-wide windows a row each while the rest still pair up),
-  instead of letting them overlap.
+  fit, and sizes the tiles unequally where that helps (a wide window and a narrow one can
+  share a row that two wide ones could not), instead of letting windows overlap.
